@@ -1,0 +1,10 @@
+/.env
+/.pytest_cache
+/.venv
+/PROJECT_CONCEPT.md
+/logs
+/tests
+/data/cache/*
+/data/memory/*
+/data/state/*
+**/__pycache__/*

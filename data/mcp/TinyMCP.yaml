@@ -1,0 +1,61 @@
+tools:
+  spotify_add_to_playlist:
+    permissions: ask
+    visible: false
+  spotify_create_playlist:
+    permissions: ask
+    visible: false
+  spotify_get_lyrics:
+    permissions: allow
+    visible: true
+  spotify_get_playback_device:
+    permissions: allow
+    visible: false
+  spotify_get_playback_state:
+    permissions: allow
+    visible: false
+  spotify_get_playlist:
+    permissions: allow
+    visible: false
+  spotify_get_user_playlists:
+    permissions: allow
+    visible: false
+  spotify_playback_control:
+    permissions: ask
+    visible: false
+  spotify_playback_mode:
+    permissions: ask
+    visible: false
+  spotify_remove_from_playlist:
+    permissions: ask
+    visible: false
+  spotify_search:
+    permissions: allow
+    visible: true
+  spotify_set_playback_device:
+    permissions: ask
+    visible: false
+  web_fetch:
+    permissions: ask
+    visible: true
+  web_search:
+    permissions: allow
+    visible: true
+  web_weather:
+    permissions: allow
+    visible: false
+  youtube_get_channel:
+    permissions: ask
+    visible: true
+  youtube_get_playlist:
+    permissions: ask
+    visible: true
+  youtube_get_transcript:
+    permissions: ask
+    visible: true
+  youtube_get_video_info:
+    permissions: ask
+    visible: true
+  youtube_search:
+    permissions: ask
+    visible: true

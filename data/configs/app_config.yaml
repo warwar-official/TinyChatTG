@@ -1,0 +1,47 @@
+providers:
+  lmstudio:
+    name: lmstudio
+    url: http://192.168.50.212:1234
+    description: "LM Studio local OpenAI-compatible endpoint"
+    default_model: "default_model"
+    supports_images: false
+
+models:
+  main_model:
+    provider: lmstudio
+    model: default_model
+  backup_model: null
+  image_model: null
+
+mcp:
+  TinyMCP:
+    enabled: true
+    command: "/home/warwar/Документи/Antigravity/TinyMCP/.venv/bin/python"
+    args:
+      - "/home/warwar/Документи/Antigravity/TinyMCP/server.py"
+    env: {}
+
+memory:
+  model_path: data/memory/model
+  db_path: data/memory/db
+  embedding_model: intfloat/multilingual-e5-large
+  max_tool_response_chars: 15000
+
+bot:
+  auth_code_ttl_seconds: 60
+  max_auth_failures_per_ttl: 5
+  start_spam_limit_per_minute: 5
+  start_spam_ban_seconds: 3600
+  last_messages_tail: 5
+  max_messages: 15
+  max_tool_iterations: 5
+
+logging:
+  debug: true
+  logs_path: logs
+
+concurrency:
+  max_concurrent: 1
+  requests_per_minute: 60
+  primary_workers: 1
+  secondary_workers: 1

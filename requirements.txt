@@ -1,0 +1,12 @@
+aiogram
+aiohttp
+qdrant-client
+fastembed
+numpy
+python-dotenv
+pydantic
+aiofiles
+requests
+PyYAML
+pytest
+pytest-asyncio
