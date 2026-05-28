@@ -7,4 +7,5 @@
 /data/cache/*
 /data/memory/*
 /data/state/*
+/data/images/*
 **/__pycache__/*

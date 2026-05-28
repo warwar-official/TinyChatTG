@@ -6,11 +6,22 @@ providers:
     default_model: "default_model"
     supports_images: false
 
+  gemini:
+    name: gemini
+    description: "Google Gemini REST API provider"
+    # api_key is read from the GEMINI_API_KEY environment variable at runtime.
+    # Set it here only if you want to override the env var.
+    api_key: ""
+    default_model: "gemma-4-31b-it"
+    supports_images: true
+
 models:
   main_model:
-    provider: lmstudio
-    model: default_model
-  backup_model: null
+    provider: gemini
+    model: gemma-4-31b-it
+  backup_model:
+    provider: gemini
+    model: gemma-4-26b-a4b-it
   image_model: null
 
 mcp:
@@ -42,6 +53,6 @@ logging:
 
 concurrency:
   max_concurrent: 1
-  requests_per_minute: 60
+  requests_per_minute: 5
   primary_workers: 1
   secondary_workers: 1

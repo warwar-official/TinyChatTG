@@ -13,6 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from imports.config import CONFIG, get_provider, get_bot_config, get_mcp, get_telegram_token
 from imports.providers.lm_studio import LMStudioProvider
+from imports.providers.gemini import GeminiProvider
 from imports.memory.store import MemoryStore
 from imports.mcp.manager import MCPManager
 from imports.orchestrator import Orchestrator
@@ -55,8 +56,25 @@ else:
 
 dp = Dispatcher()
 
-provider_conf = get_provider('lmstudio') or {}
-lm = LMStudioProvider(provider_conf.get('url', 'http://192.168.50.212:1234'), provider_conf.get('default_model', 'default_model'))
+def _build_provider():
+    """Instantiate the correct AI provider based on app_config.yaml → models.main_model."""
+    main_model_cfg = (CONFIG.get('models') or {}).get('main_model') or {}
+    provider_name = main_model_cfg.get('provider', 'lmstudio')
+
+    if provider_name == 'gemini':
+        prov_cfg = get_provider('gemini') or {}
+        api_key = os.environ.get('GEMINI_API_KEY') or prov_cfg.get('api_key') or ''
+        model = main_model_cfg.get('model') or prov_cfg.get('default_model') or 'gemini-2.0-flash'
+        return GeminiProvider(api_key=api_key, default_model=model)
+
+    # default: lmstudio
+    prov_cfg = get_provider('lmstudio') or {}
+    return LMStudioProvider(
+        prov_cfg.get('url', 'http://192.168.50.212:1234'),
+        prov_cfg.get('default_model', 'default_model'),
+    )
+
+lm = _build_provider()
 mem_store = MemoryStore(CONFIG)
 # MCP configuration - pass all mcp blocks to the new manager
 mcp_cfg = CONFIG.get('mcp') or {}
@@ -147,6 +165,82 @@ orchestrator = Orchestrator(
     status_callback=_tool_status,
     conv_store=conv_store,
 )
+
+
+# --- Forward Debounce Buffer ---
+# Keeps track of incoming messages per user so we can group them together
+# if they arrive in rapid succession (e.g. forwarded albums).
+_user_buffers: Dict[int, list] = {}
+_user_flush_tasks: Dict[int, asyncio.Task] = {}
+
+async def _flush_user_buffer(user_id: int, chat_id: int):
+    """Wait for a brief debounce period, then submit all accumulated messages."""
+    await asyncio.sleep(2.0)
+    
+    parts = _user_buffers.pop(user_id, [])
+    _user_flush_tasks.pop(user_id, None)
+    
+    if not parts:
+        return
+
+    # Combine all accumulated parts into one single message context
+    final_text = "\n\n".join(parts)
+    
+    # Typing indicator while processing
+    async def _keep_typing(cid: int, interval: float = 4.0):
+        try:
+            while True:
+                try:
+                    await bot.send_chat_action(cid, "typing")
+                except Exception:
+                    pass
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+    typing_task = None
+    try:
+        typing_task = asyncio.create_task(_keep_typing(chat_id))
+    except Exception:
+        pass
+
+    try:
+        resp = await orchestrator.submit_primary(user_id, chat_id, final_text)
+    except Exception as e:
+        await bot.send_message(chat_id, f"Orchestrator error: {e}")
+        return
+    finally:
+        if typing_task:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+    if not resp:
+        await bot.send_message(chat_id, "Empty response from orchestrator")
+        return
+
+    if resp.get('error'):
+        await bot.send_message(chat_id, f"Error: {resp.get('error')}")
+        return
+
+    if resp.get('assistant'):
+        try:
+            await bot.send_message(chat_id, resp.get('assistant'), parse_mode="Markdown")
+        except Exception:
+            await bot.send_message(chat_id, resp.get('assistant'))
+        return
+
+    if resp.get('tool'):
+        tool = resp.get('tool')
+        result = resp.get('result')
+        if isinstance(result, dict) and result.get('error'):
+            await bot.send_message(chat_id, f"__{tool}: \"error: {result.get('error')}\"__")
+        else:
+            await bot.send_message(chat_id, f"__{tool}: \"{result}\"__")
+
+# -------------------------------
 
 
 def _gen_code() -> str:
@@ -243,7 +337,7 @@ async def handle_all(message: types.Message):
     # Unknown command handling: do not forward to model
     if message.text and message.text.strip().startswith('/'):
         cmd = message.text.strip().split()[0]
-        allowed_cmds = ['/start', '/new']
+        allowed_cmds = ['/new']
         if cmd not in allowed_cmds:
             await message.reply('Unknown command')
             return
@@ -272,72 +366,59 @@ async def handle_all(message: types.Message):
         except Exception as e:
             get_user_logger(user_id).warning("Failed to download photo: %s", e)
 
-    # Mark forwarded
+    # Build forwarded-message context
     forwarded_note = ""
-    if getattr(message, 'forward_origin', None):
-        forwarded_note = "[forwarded message]\n"
-
-    # Keep sending typing action while the model generates a response
-    async def _keep_typing(chat_id: int, interval: float = 4.0):
+    forward_origin = getattr(message, 'forward_origin', None)
+    if forward_origin:
+        origin_type = getattr(forward_origin, 'type', None) or ""
         try:
-            while True:
-                try:
-                    await bot.send_chat_action(chat_id, "typing")
-                except Exception:
-                    pass
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
-
-    typing_task = None
-    try:
-        typing_task = asyncio.create_task(_keep_typing(message.chat.id))
-    except Exception:
-        typing_task = None
-
-    # Build simple chat payload
-    user_text = message.text or ("[image]" if imgs else "")
-    if forwarded_note:
-        user_text = forwarded_note + user_text
-
-    try:
-        resp = await orchestrator.submit_primary(user_id, message.chat.id, user_text)
-    except Exception as e:
-        await message.reply(f"Orchestrator error: {e}")
-        return
-    finally:
-        # stop typing indicator
-        if typing_task:
-            typing_task.cancel()
-            try:
-                await typing_task
-            except Exception:
-                pass
-
-    # Response can be assistant text or tool result
-    if not resp:
-        await message.reply("Empty response from orchestrator")
-        return
-
-    if resp.get('error'):
-        await message.reply(f"Error: {resp.get('error')}")
-        return
-
-    if resp.get('assistant'):
-        try:
-            await message.reply(resp.get('assistant'), parse_mode="Markdown")
+            # User forward
+            sender_name = (
+                getattr(getattr(forward_origin, 'sender_user', None), 'full_name', None)
+                or getattr(getattr(forward_origin, 'sender_user', None), 'username', None)
+                # Hidden-user forward
+                or getattr(forward_origin, 'sender_user_name', None)
+                # Channel / chat forward
+                or getattr(getattr(forward_origin, 'chat', None), 'title', None)
+                or getattr(getattr(forward_origin, 'sender_chat', None), 'title', None)
+            )
         except Exception:
-            await message.reply(resp.get('assistant'))
-        return
-
-    if resp.get('tool'):
-        tool = resp.get('tool')
-        result = resp.get('result')
-        if isinstance(result, dict) and result.get('error'):
-            await message.reply(f"__{tool}: \"error: {result.get('error')}\"__")
+            sender_name = None
+        if sender_name:
+            forwarded_note = f"[Forwarded from: {sender_name}]\n"
         else:
-            await message.reply(f"__{tool}: \"{result}\"__")
-        return
+            forwarded_note = "[Forwarded message]\n"
+
+    # Build user text: prefer message.text; for photos use caption; add image note
+    caption = getattr(message, 'caption', None) or ""
+    raw_text = (message.text or caption or "").strip()
+
+    parts: list[str] = []
+    if forwarded_note:
+        parts.append(forwarded_note.strip())
+    if imgs:
+        parts.append("[image attached]")
+    if raw_text:
+        parts.append(raw_text)
+
+    user_text = "\n".join(parts) if parts else "[image]" if imgs else ""
+
+    if user_text:
+        # Buffer this message
+        if user_id not in _user_buffers:
+            _user_buffers[user_id] = []
+        _user_buffers[user_id].append(user_text)
+
+        # Cancel existing flush task if present to reset the 2.0s timer
+        existing_task = _user_flush_tasks.get(user_id)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+
+        # Schedule a new flush task
+        _user_flush_tasks[user_id] = asyncio.create_task(
+            _flush_user_buffer(user_id, message.chat.id)
+        )
+
 
 
 async def main():
