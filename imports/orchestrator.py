@@ -65,6 +65,10 @@ class Orchestrator:
 
         self._tasks: List[asyncio.Task] = []
         self.pending_approvals: Dict[str, asyncio.Future] = {}
+        self._user_pending_approval: Dict[int, str] = {}   # user_id -> approval_id
+        self._user_job_tasks: Dict[int, asyncio.Task] = {}  # user_id -> in-flight task
+        self._user_interrupt: Dict[int, dict] = {}          # user_id -> {type, text, images}
+        self._stopped_users: set = set()                    # users whose queued jobs should be skipped
 
         self.tools = {'tools': {}}
         if self.mcp_mgr:
@@ -139,8 +143,26 @@ class Orchestrator:
         while True:
             job = await self.primary_queue.get()
             fut = job.get('future')
+            user_id = job.get('user_id')
+
+            # Skip queued jobs for users who sent /stop
+            if user_id and user_id in self._stopped_users:
+                self._stopped_users.discard(user_id)
+                if fut and not fut.done():
+                    fut.set_result({"error": "stopped"})
+                continue
+
             try:
-                res = await self._handle_primary_job(job)
+                task = asyncio.create_task(self._handle_primary_job(job))
+                if user_id:
+                    self._user_job_tasks[user_id] = task
+                try:
+                    res = await task
+                except asyncio.CancelledError:
+                    res = {"error": "stopped"}
+                finally:
+                    if user_id and self._user_job_tasks.get(user_id) is task:
+                        self._user_job_tasks.pop(user_id, None)
                 if fut and not fut.done():
                     fut.set_result(res)
             except Exception as e:
@@ -164,6 +186,33 @@ class Orchestrator:
         fut = self.pending_approvals.get(approval_id)
         if fut and not fut.done():
             fut.set_result(bool(approved))
+
+    async def interrupt_user(self, user_id: int, interrupt_type: str,
+                             text: Optional[str] = None,
+                             images: Optional[List[str]] = None) -> None:
+        """Decline any pending approval and inject an interrupt signal into the tool loop."""
+        self._user_interrupt[user_id] = {"type": interrupt_type, "text": text, "images": images}
+        approval_id = self._user_pending_approval.get(user_id)
+        if approval_id:
+            fut = self.pending_approvals.get(approval_id)
+            if fut and not fut.done():
+                fut.set_result(False)
+
+    async def stop_user(self, user_id: int) -> None:
+        """Cancel any in-flight generation and pending approval for this user."""
+        self._user_interrupt[user_id] = {"type": "stop"}
+        # Decline pending approval
+        approval_id = self._user_pending_approval.get(user_id)
+        if approval_id:
+            fut = self.pending_approvals.get(approval_id)
+            if fut and not fut.done():
+                fut.set_result(False)
+        # Cancel in-flight job task
+        task = self._user_job_tasks.get(user_id)
+        if task and not task.done():
+            task.cancel()
+        # Mark so subsequent queued jobs are also skipped
+        self._stopped_users.add(user_id)
 
     async def _acquire_rate_slot(self):
         """Simple requests-per-minute limiter for model calls."""
@@ -369,8 +418,9 @@ class Orchestrator:
         # Build context and call model (with tool loop)
         res = await self._tool_loop(user_id, chat_id, text, functions, ulog)
         
-        # If an error occurred, rollback all messages appended during this request (user message + any intermediate tools)
-        if res.get("error") and start_id is not None:
+        # If an error occurred, rollback — but NOT for graceful stop/new signals
+        non_rollback_errors = {"stopped", "stop", "new"}
+        if res.get("error") and res.get("error") not in non_rollback_errors and start_id is not None:
             try:
                 self.conv_store.delete_since_id(user_id, start_id)
                 ulog.info("Rolled back conversation history since id %s due to error", start_id)
@@ -495,13 +545,10 @@ class Orchestrator:
                         ulog.error("Failed to append tool result: %s", e)
                     continue
 
-                # Send status to user
+                # Brief status — show only tool name, no args
                 if self.status_callback:
                     try:
-                        args_preview = json.dumps(tool_args, ensure_ascii=False)
-                        if len(args_preview) > 200:
-                            args_preview = args_preview[:200] + "..."
-                        await self.status_callback(chat_id, f"**{tool_name}**: \"{args_preview}\"")
+                        await self.status_callback(chat_id, f"_Using: **{tool_name}**..._")
                     except Exception:
                         pass
 
@@ -511,26 +558,60 @@ class Orchestrator:
                     loop = asyncio.get_event_loop()
                     fut = loop.create_future()
                     self.pending_approvals[approval_id] = fut
+                    self._user_pending_approval[user_id] = approval_id
                     if self.approval_callback:
                         try:
                             await self.approval_callback(approval_id, user_id, {"name": tool_name, "args": tool_args})
                         except Exception:
                             pass
                     approved = await fut
+                    self._user_pending_approval.pop(user_id, None)
                     self.pending_approvals.pop(approval_id, None)
+
                     if not approved:
-                        declined_text = f"Tool {tool_name} was declined by user."
-                        try:
-                            self.conv_store.append_message(user_id, 'tool', declined_text, meta={'tool': tool_name})
-                        except Exception:
-                            pass
-                        if self.status_callback:
+                        interrupt = self._user_interrupt.pop(user_id, None)
+                        i_type = interrupt.get("type") if interrupt else None
+                        i_text = interrupt.get("text") if interrupt else None
+                        i_imgs = interrupt.get("images") if interrupt else None
+                        declined_note = f"Tool '{tool_name}' was declined."
+
+                        if i_type == "message":
+                            # User sent a new message instead of tapping approve/decline
                             try:
-                                await self.status_callback(chat_id, f"**{tool_name}**: \"declined\"")
+                                self.conv_store.append_message(user_id, 'tool', declined_note,
+                                                               meta={'tool': tool_name, 'tool_call_id': call_id})
                             except Exception:
                                 pass
-                        # Continue loop — model will see the declined result and can respond
-                        continue
+                            if i_text is not None:
+                                try:
+                                    img_meta = {"images": i_imgs} if i_imgs else None
+                                    self.conv_store.append_message(user_id, 'user', i_text, meta=img_meta)
+                                except Exception:
+                                    pass
+                            current_text = i_text or current_text
+                            continue
+
+                        elif i_type in ("stop", "new"):
+                            try:
+                                self.conv_store.append_message(user_id, 'tool', declined_note,
+                                                               meta={'tool': tool_name, 'tool_call_id': call_id})
+                            except Exception:
+                                pass
+                            return {"error": i_type}
+
+                        else:
+                            # Manual button decline
+                            try:
+                                self.conv_store.append_message(user_id, 'tool', declined_note,
+                                                               meta={'tool': tool_name, 'tool_call_id': call_id})
+                            except Exception:
+                                pass
+                            if self.status_callback:
+                                try:
+                                    await self.status_callback(chat_id, f"_**{tool_name}** declined_")
+                                except Exception:
+                                    pass
+                            continue
 
                 # Execute tool
                 result = await self._execute_tool(tool_name, tool_args, tool_conf, user_id, ulog)

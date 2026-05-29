@@ -1,7 +1,7 @@
 providers:
   lmstudio:
     name: lmstudio
-    url: http://192.168.50.212:1234
+    url: null
     description: "LM Studio local OpenAI-compatible endpoint"
     default_model: "default_model"
     supports_images: false
@@ -45,7 +45,7 @@ bot:
   start_spam_ban_seconds: 3600
   last_messages_tail: 5
   max_messages: 15
-  max_tool_iterations: 5
+  max_tool_iterations: 10
 
 logging:
   debug: true
@@ -53,6 +53,6 @@ logging:
 
 concurrency:
   max_concurrent: 1
-  requests_per_minute: 5
+  requests_per_minute: 15
   primary_workers: 1
   secondary_workers: 1

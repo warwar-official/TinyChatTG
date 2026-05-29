@@ -203,12 +203,18 @@ mem_store.merge_callback = _merge_memories
 # Approval callback: sends approval UI to user and waits for user's decision via callback_query handler
 async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Allow", callback_data=f"tool_approve:{approval_id}:1"),
-         InlineKeyboardButton(text="Decline", callback_data=f"tool_approve:{approval_id}:0")]
+        [InlineKeyboardButton(text="✅ Allow", callback_data=f"tool_approve:{approval_id}:1"),
+         InlineKeyboardButton(text="❌ Decline", callback_data=f"tool_approve:{approval_id}:0")]
     ])
-    text = f"Tool `{tool_call.get('name')}` wants to run with args: {tool_call.get('args')}\nAllow?"
+    args_preview = str(tool_call.get('args', ''))
+    if len(args_preview) > 320:
+        args_preview = args_preview[:317] + "..."
+    text = (
+        f"🔧 <b>{html.escape(str(tool_call.get('name', '?')))}</b> wants to run:\n"
+        f"<code>{html.escape(args_preview)}</code>\n\nAllow?"
+    )
     try:
-        await bot.send_message(user_id, text, reply_markup=kb)
+        await bot.send_message(user_id, text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         pass
 
@@ -290,6 +296,10 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
         await bot.send_message(chat_id, "Empty response from orchestrator")
         return
 
+    # Graceful stop/new — no error message needed
+    if resp.get('error') in ('stopped', 'stop', 'new'):
+        return
+
     if resp.get('error'):
         await bot.send_message(chat_id, f"Error: {resp.get('error')}")
         return
@@ -362,6 +372,12 @@ async def cmd_new(message: types.Message):
     if not auth_store.is_authorized(user_id):
         await message.reply("Authorize first with /start")
         return
+
+    # Interrupt any pending approval so the decline is recorded before summarization
+    if user_id in orchestrator._user_pending_approval:
+        await orchestrator.interrupt_user(user_id, "new", None)
+        await asyncio.sleep(0.2)  # let the tool loop handle the interrupt
+
     # Extract memories from conversation and clear context
     try:
         history = conv_store.get_history(user_id)
@@ -376,6 +392,23 @@ async def cmd_new(message: types.Message):
         get_user_logger(user_id).exception("Failed to start new conversation")
         print(traceback.format_exc())
         await message.reply("Failed to start new conversation (see server logs)")
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: types.Message):
+    user_id = message.from_user.id
+    if not auth_store.is_authorized(user_id):
+        await message.reply("Authorize first with /start")
+        return
+    # Cancel any pending debounce flush
+    task = _user_flush_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+    # Clear debounce buffer
+    _user_buffers.pop(user_id, None)
+    # Stop in-flight orchestrator job + pending approval
+    await orchestrator.stop_user(user_id)
+    await message.reply("⏹ Stopped.")
 
 
 @dp.message()
@@ -411,7 +444,7 @@ async def handle_all(message: types.Message):
     # Unknown command handling: do not forward to model
     if message.text and message.text.strip().startswith('/'):
         cmd = message.text.strip().split()[0]
-        allowed_cmds = ['/new']
+        allowed_cmds = ['/new', '/stop']
         if cmd not in allowed_cmds:
             await message.reply('Unknown command')
             return
@@ -477,6 +510,11 @@ async def handle_all(message: types.Message):
 
     user_text = "\n".join(parts) if parts else "[image]" if imgs else ""
 
+    # If this user has a pending approval, intercept: decline the tool and inject the new message
+    if user_id in orchestrator._user_pending_approval:
+        await orchestrator.interrupt_user(user_id, "message", user_text, images=imgs if imgs else None)
+        return
+
     if user_text or imgs:
         # Buffer this message and any images
         if user_id not in _user_buffers:
@@ -518,7 +556,10 @@ async def main():
     # Register bot commands (if real bot)
     try:
         if TELEGRAM_TOKEN:
-            await bot.set_my_commands([BotCommand(command='new', description='Clean up conversation')])
+            await bot.set_my_commands([
+                BotCommand(command='new', description='Start a new conversation'),
+                BotCommand(command='stop', description='Stop current generation'),
+            ])
     except Exception:
         pass
 

@@ -11,7 +11,7 @@ tool_using_explanation_prompt: |
   ## Web Browsing Skills
   **Step 1:** Make a meaningul search query.
   **Step 2:** Request more answers.
-  **Step 3:** Assess Snippets First: After using web.search, read the provided snippets. If they contain the complete answer to the user's query, STOP and provide the answer.
+  **Step 3:** Assess Snippets First: After using web.search, read the provided snippets.
   **Step 4:** Deep Dive: If the snippets are insufficient, use web.fetch on the most promising URL from the search results to read the full content.
   **Step 5:** Handling Scraper Blocks: If web.fetch returns an empty result, an error, or asks for CAPTCHA, it means the site is blocking automated access. DO NOT retry the same URL. Immediately try web.fetch on the next relevant URL.
   **Step 6:** Smart Retry: Do not retry same things same way everytime. If web.search or web.fetch doesn't return correct result, change arguments.
