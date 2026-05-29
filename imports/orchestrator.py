@@ -548,7 +548,7 @@ class Orchestrator:
                 # Brief status — show only tool name, no args
                 if self.status_callback:
                     try:
-                        await self.status_callback(chat_id, f"_Using: **{tool_name}**..._")
+                        await self.status_callback(chat_id, f"Using: <i><b>{tool_name}</b>...</i>")
                     except Exception:
                         pass
 
@@ -608,7 +608,7 @@ class Orchestrator:
                                 pass
                             if self.status_callback:
                                 try:
-                                    await self.status_callback(chat_id, f"_**{tool_name}** declined_")
+                                    await self.status_callback(chat_id, f"<i><b>{tool_name}</b> declined</i>")
                                 except Exception:
                                     pass
                             continue
@@ -643,7 +643,7 @@ class Orchestrator:
                 if isinstance(result, dict) and result.get('error'):
                     if self.status_callback:
                         try:
-                            await self.status_callback(chat_id, f"**{tool_name}**: \"error: {result.get('error')}\"")
+                            await self.status_callback(chat_id, f"<i><b>{tool_name}</b>: \"error: {result.get('error')}\"</i>")
                         except Exception:
                             pass
 

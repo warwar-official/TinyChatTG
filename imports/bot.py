@@ -203,8 +203,8 @@ mem_store.merge_callback = _merge_memories
 # Approval callback: sends approval UI to user and waits for user's decision via callback_query handler
 async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Allow", callback_data=f"tool_approve:{approval_id}:1"),
-         InlineKeyboardButton(text="❌ Decline", callback_data=f"tool_approve:{approval_id}:0")]
+        [InlineKeyboardButton(text="Allow", callback_data=f"tool_approve:{approval_id}:1"),
+         InlineKeyboardButton(text="Decline", callback_data=f"tool_approve:{approval_id}:0")]
     ])
     args_preview = str(tool_call.get('args', ''))
     if len(args_preview) > 320:
