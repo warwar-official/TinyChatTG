@@ -6,6 +6,8 @@ import os
 import asyncio
 from pathlib import Path
 from typing import Dict, Any
+import re
+import html
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -47,6 +49,70 @@ class DummyBot:
         @staticmethod
         async def close():
             return None
+
+def _markdown_to_html(text: str) -> str:
+    """Convert simple CommonMark-like syntax to Telegram-safe HTML.
+
+    - Preserves fenced code blocks (```...```) and inline code (`...`).
+    - Converts nested `_**bold**_` and `**_italic_**` combos to nested tags.
+    - Converts `**...**` and `__...__` to `<b>`, and `_..._` and `*...*` to `<i>`.
+    This is a pragmatic converter for typical assistant outputs; it intentionally
+    HTML-escapes text before injecting tags to avoid accidental HTML.
+    """
+    if not text:
+        return text
+
+    # 1) Extract fenced code blocks
+    code_blocks: dict[str, str] = {}
+    def _cb_code(m):
+        key = f"@@CODEBLOCK{len(code_blocks)}@@"
+        code_blocks[key] = m.group(1)
+        return key
+    text = re.sub(r"```(.*?)```", _cb_code, text, flags=re.DOTALL)
+
+    # 2) Extract inline code
+    inline_codes: dict[str, str] = {}
+    def _cb_inline(m):
+        key = f"@@INLCODE{len(inline_codes)}@@"
+        inline_codes[key] = m.group(1)
+        return key
+    text = re.sub(r"`([^`]+?)`", _cb_inline, text)
+
+    # 3) Escape remaining text to HTML
+    text = html.escape(text)
+
+    # 3.5) Typography and list/header adjustments (outside code spans)
+    # Replace long em-dash with shorter en-dash
+    text = text.replace('—', '–')
+
+    # Replace Markdown header markers (#, ##, etc.) at start of line with a chevron
+    # Use multiline flag so ^ matches line starts
+    text = re.sub(r'(?m)^\s*#+\s+', '➤ ', text)
+
+    # Replace unordered list markers '*' or '-' at start of line with a bullet '•'
+    text = re.sub(r'(?m)^([ \t]*)[\*-][ \t]+', r"\1• ", text)
+
+    # 4) Convert nested combinations first
+    # _**text**_  -> <i><b>text</b></i>
+    text = re.sub(r"_(\*\*(.+?)\*\*)_", lambda m: f"<i><b>{m.group(2)}</b></i>", text, flags=re.DOTALL)
+    # **_text_** -> <b><i>text</i></b>
+    text = re.sub(r"\*\*(\_(.+?)\_)\*\*", lambda m: f"<b><i>{m.group(2)}</i></b>", text, flags=re.DOTALL)
+
+    # 5) Simple strong/italic replacements
+    text = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
+    text = re.sub(r"_(.+?)_", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
+    text = re.sub(r"\*(.+?)\*", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
+
+    # 6) Reinsert inline code (escaped inside code tag)
+    for k, v in inline_codes.items():
+        text = text.replace(k, f"<code>{html.escape(v)}</code>")
+
+    # 7) Reinsert code blocks
+    for k, v in code_blocks.items():
+        text = text.replace(k, f"<pre><code>{html.escape(v)}</code></pre>")
+
+    return text
 
 
 if not TELEGRAM_TOKEN:
@@ -150,7 +216,7 @@ async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]
 # Status callback: sends tool status messages to user
 async def _tool_status(chat_id: int, text: str):
     try:
-        await bot.send_message(chat_id, text, parse_mode="Markdown")
+        await bot.send_message(chat_id, _markdown_to_html(text), parse_mode="HTML")
     except Exception:
         try:
             await bot.send_message(chat_id, text)
@@ -227,7 +293,8 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
 
     if resp.get('assistant'):
         try:
-            await bot.send_message(chat_id, resp.get('assistant'), parse_mode="Markdown")
+            assistant_text = resp.get('assistant')
+            await bot.send_message(chat_id, _markdown_to_html(assistant_text), parse_mode="HTML")
         except Exception:
             await bot.send_message(chat_id, resp.get('assistant'))
         return
@@ -236,9 +303,13 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
         tool = resp.get('tool')
         result = resp.get('result')
         if isinstance(result, dict) and result.get('error'):
-            await bot.send_message(chat_id, f"__{tool}: \"error: {result.get('error')}\"__")
+            text = f"__{tool}: \"error: {result.get('error')}\"__"
         else:
-            await bot.send_message(chat_id, f"__{tool}: \"{result}\"__")
+            text = f"__{tool}: \"{result}\"__"
+        try:
+            await bot.send_message(chat_id, _markdown_to_html(text), parse_mode="HTML")
+        except Exception:
+            await bot.send_message(chat_id, text)
 
 # -------------------------------
 
@@ -440,7 +511,7 @@ async def main():
     # Register bot commands (if real bot)
     try:
         if TELEGRAM_TOKEN:
-            await bot.set_my_commands([BotCommand(command='start', description='Authorize'), BotCommand(command='new', description='Start new conversation')])
+            await bot.set_my_commands([BotCommand(command='new', description='Clean up conversation')])
     except Exception:
         pass
 

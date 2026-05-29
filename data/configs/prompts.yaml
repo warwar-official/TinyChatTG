@@ -82,6 +82,8 @@ fact_extraction_prompt: |
   Extract important facts from the conversation below.
   Return a JSON array of objects with keys "title" and "text".
   Only extract facts worth remembering long-term (preferences, decisions, personal info, project details).
+  Keep facts meaningful and self-sufficient. "User asked to summarize text." - useless. "User asked to summarize text about Gemini and it's capabilities." - useful.
+  Do not extract temporary information. "Temperature in Kyiv is 25 degrees." - useless. "Web search provide no results." - useless.
   Return only valid JSON, nothing else.
 
 context_template: |

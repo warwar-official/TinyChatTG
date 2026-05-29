@@ -442,5 +442,5 @@ class MemoryStore:
 
     # Simple helper for manual memory addition tool
     def add_memory_manual(self, user_id: int, title: str, text: str) -> Dict[str, Any]:
-        meta = {"title": title}
+        meta = {"title": title, "source": "manual"}
         return self.add_memory(user_id, text, meta=meta)

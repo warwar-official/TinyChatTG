@@ -8,4 +8,5 @@
 /data/memory/*
 /data/state/*
 /data/images/*
+/data/mcp/*
 **/__pycache__/*
