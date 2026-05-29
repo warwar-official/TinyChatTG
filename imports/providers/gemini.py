@@ -66,7 +66,11 @@ def _convert_messages_to_gemini(
         tool_calls = msg.get("tool_calls") or []
 
         if role == "system":
-            if content:
+            if isinstance(content, list):
+                sys_text = "\n".join([p.get("text", "") for p in content if p.get("type") == "text"])
+                if sys_text:
+                    system_parts.append(sys_text)
+            elif content:
                 system_parts.append(content)
             continue
 
@@ -74,7 +78,12 @@ def _convert_messages_to_gemini(
             gemini_role = "model"
             parts: list[dict] = []
             if content:
-                parts.append({"text": content})
+                if isinstance(content, list):
+                    for p in content:
+                        if p.get("type") == "text" and p.get("text"):
+                            parts.append({"text": p["text"]})
+                else:
+                    parts.append({"text": content})
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 raw_args = fn.get("arguments", "{}")
@@ -111,9 +120,33 @@ def _convert_messages_to_gemini(
             })
 
         else:  # user
+            user_parts = []
+            if isinstance(content, list):
+                for p in content:
+                    if p.get("type") == "text" and p.get("text"):
+                        user_parts.append({"text": p["text"]})
+                    elif p.get("type") == "image_url":
+                        url = p.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            try:
+                                header, b64 = url.split(",", 1)
+                                mime = header.split(";")[0].split(":")[1]
+                                user_parts.append({
+                                    "inlineData": {
+                                        "mimeType": mime,
+                                        "data": b64
+                                    }
+                                })
+                            except Exception:
+                                pass
+            else:
+                if content:
+                    user_parts.append({"text": content})
+            if not user_parts:
+                user_parts.append({"text": ""})
             contents.append({
                 "role": "user",
-                "parts": [{"text": content}],
+                "parts": user_parts,
             })
 
     system_instruction = "\n\n".join(system_parts) if system_parts else None

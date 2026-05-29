@@ -123,10 +123,16 @@ class Orchestrator:
         except Exception:
             pass
 
-    async def submit_primary(self, user_id: int, chat_id: int, text: str) -> Dict[str, Any]:
+    async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
-        await self.primary_queue.put({"user_id": int(user_id), "chat_id": int(chat_id), "text": text, "future": fut})
+        await self.primary_queue.put({
+            "user_id": int(user_id), 
+            "chat_id": int(chat_id), 
+            "text": text, 
+            "images": images, 
+            "future": fut
+        })
         return await fut
 
     async def _primary_worker(self):
@@ -272,7 +278,31 @@ class Orchestrator:
                     else:
                         messages.append({"role": "assistant", "content": text})
                 else:
-                    messages.append({"role": role, "content": text})
+                    images = meta.get('images') if isinstance(meta, dict) else None
+                    if images:
+                        import base64
+                        import mimetypes
+                        content = []
+                        if text:
+                            content.append({"type": "text", "text": text})
+                        for img_path in images:
+                            try:
+                                with open(img_path, "rb") as f:
+                                    b64 = base64.b64encode(f.read()).decode('utf-8')
+                                mime, _ = mimetypes.guess_type(img_path)
+                                mime = mime or 'image/jpeg'
+                                content.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                                })
+                            except Exception as e:
+                                logger.warning(f"Could not load image {img_path}: {e}")
+                        
+                        if not content:
+                            content = text
+                        messages.append({"role": role, "content": content})
+                    else:
+                        messages.append({"role": role, "content": text})
         except Exception as e:
             logger.warning("Failed to get history for user %d: %s", user_id, e)
             # At minimum, include the current message
@@ -322,12 +352,14 @@ class Orchestrator:
         user_id = job.get('user_id')
         chat_id = job.get('chat_id')
         text = job.get('text')
+        images = job.get('images')
         ulog = get_user_logger(user_id)
 
         # Append user message to persistent conversation history
         start_id = None
         try:
-            start_id = self.conv_store.append_message(user_id, 'user', text)
+            meta = {"images": images} if images else None
+            start_id = self.conv_store.append_message(user_id, 'user', text, meta=meta)
         except Exception as e:
             ulog.error("Failed to append user message: %s", e)
 

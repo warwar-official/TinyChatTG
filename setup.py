@@ -127,7 +127,7 @@ def create_folder_structure():
 
 def create_tools_config():
     """Create app_tools.yaml if it doesn't exist."""
-    tools_file = Path("data/configs/app_tools.yaml")
+    tools_file = Path("data/mcp/app_tools.yaml")
     if not tools_file.exists():
         print_status("Creating default app_tools.yaml...", "INFO")
         tools_file.parent.mkdir(parents=True, exist_ok=True)

@@ -236,17 +236,20 @@ orchestrator = Orchestrator(
 # --- Forward Debounce Buffer ---
 # Keeps track of incoming messages per user so we can group them together
 # if they arrive in rapid succession (e.g. forwarded albums).
-_user_buffers: Dict[int, list] = {}
+_user_buffers: Dict[int, Dict[str, list]] = {}
 _user_flush_tasks: Dict[int, asyncio.Task] = {}
 
 async def _flush_user_buffer(user_id: int, chat_id: int):
-    """Wait for a brief debounce period, then submit all accumulated messages."""
+    """Wait for a brief debounce period, then submit all accumulated messages and images."""
     await asyncio.sleep(2.0)
     
-    parts = _user_buffers.pop(user_id, [])
+    buffer_data = _user_buffers.pop(user_id, {})
     _user_flush_tasks.pop(user_id, None)
     
-    if not parts:
+    parts = buffer_data.get("text_parts", [])
+    images = buffer_data.get("images", [])
+    
+    if not parts and not images:
         return
 
     # Combine all accumulated parts into one single message context
@@ -271,7 +274,7 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
         pass
 
     try:
-        resp = await orchestrator.submit_primary(user_id, chat_id, final_text)
+        resp = await orchestrator.submit_primary(user_id, chat_id, final_text, images=images)
     except Exception as e:
         await bot.send_message(chat_id, f"Orchestrator error: {e}")
         return
@@ -474,11 +477,15 @@ async def handle_all(message: types.Message):
 
     user_text = "\n".join(parts) if parts else "[image]" if imgs else ""
 
-    if user_text:
-        # Buffer this message
+    if user_text or imgs:
+        # Buffer this message and any images
         if user_id not in _user_buffers:
-            _user_buffers[user_id] = []
-        _user_buffers[user_id].append(user_text)
+            _user_buffers[user_id] = {"text_parts": [], "images": []}
+        
+        if user_text:
+            _user_buffers[user_id]["text_parts"].append(user_text)
+        if imgs:
+            _user_buffers[user_id]["images"].extend(imgs)
 
         # Cancel existing flush task if present to reset the 2.0s timer
         existing_task = _user_flush_tasks.get(user_id)
