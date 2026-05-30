@@ -301,8 +301,11 @@ class GeminiProvider:
 
                             return result
 
-                        elif resp.status in (429, 503):
-                            wait = backoff * (5 if resp.status == 429 else 1)
+                        elif resp.status in (429, 500, 503):
+                            if resp.status == 500:
+                                wait = 5.0
+                            else:
+                                wait = backoff * (5 if resp.status == 429 else 1)
                             await asyncio.sleep(wait)
                             backoff = min(backoff * 2, 30)
                             attempt += 1

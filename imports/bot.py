@@ -63,6 +63,23 @@ def _markdown_to_html(text: str) -> str:
     if not text:
         return text
 
+    # LaTeX arrow replacements
+    latex_reps = {
+        r"\\rightarrow\b": "→",
+        r"\\leftarrow\b": "←",
+        r"\\Rightarrow\b": "⇒",
+        r"\\Leftarrow\b": "⇐",
+        r"\\leftrightarrow\b": "↔",
+        r"\\Leftrightarrow\b": "⇔",
+        r"\\longrightarrow\b": "⟶",
+        r"\\longleftarrow\b": "⟵",
+        r"\\implies\b": "⟹",
+        r"\\iff\b": "⟺",
+        r"\\to\b": "→",
+    }
+    for k, v in latex_reps.items():
+        text = re.sub(k, v, text)
+
     # 1) Extract fenced code blocks
     code_blocks: dict[str, str] = {}
     def _cb_code(m):
@@ -95,15 +112,15 @@ def _markdown_to_html(text: str) -> str:
 
     # 4) Convert nested combinations first
     # _**text**_  -> <i><b>text</b></i>
-    text = re.sub(r"_(\*\*(.+?)\*\*)_", lambda m: f"<i><b>{m.group(2)}</b></i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![A-Za-z0-9])_(\*\*(.+?)\*\*)_(?![A-Za-z0-9])", lambda m: f"<i><b>{m.group(2)}</b></i>", text, flags=re.DOTALL)
     # **_text_** -> <b><i>text</i></b>
     text = re.sub(r"\*\*(\_(.+?)\_)\*\*", lambda m: f"<b><i>{m.group(2)}</i></b>", text, flags=re.DOTALL)
 
     # 5) Simple strong/italic replacements
     text = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
     text = re.sub(r"__(.+?)__", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
-    text = re.sub(r"_(.+?)_", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
-    text = re.sub(r"\*(.+?)\*", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![A-Za-z0-9])_(.+?)_(?![A-Za-z0-9])", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![A-Za-z0-9])\*(.+?)\*(?![A-Za-z0-9])", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
 
     # 6) Reinsert inline code (escaped inside code tag)
     for k, v in inline_codes.items():
