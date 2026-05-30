@@ -136,26 +136,21 @@ class AuthStore:
         bans = self.get_bans(user_id)
         return now < bans.get('code_ban_until', 0)
 
-    def record_message(self, user_id: int, per_second_limit: int = 3, per_minute_limit: int = 60, ban_seconds: int = 300) -> Dict[str, Any]:
+    def record_message(self, user_id: int, per_minute_limit: int = 60, ban_seconds: int = 300) -> Dict[str, Any]:
         """Record a message timestamp and enforce rate limits. Returns {'banned': bool, 'reason': str or None}"""
         now = time.time()
         u = self._get_user(user_id)
         if not u.get('authorized'):
             return {'banned': False, 'reason': None}
 
+        bans = u.get('bans', {}) or {}
+        if now < bans.get('message_ban_until', 0):
+            return {'banned': True, 'reason': 'already_banned'}
+
         mts = u.get('message_timestamps') or []
         mts = [t for t in mts if now - t <= 60]
         mts.append(now)
         u['message_timestamps'] = mts
-
-        # check per-second
-        last1 = [t for t in mts if now - t <= 1]
-        if len(last1) > per_second_limit:
-            u.setdefault('bans', {})['message_ban_until'] = now + ban_seconds
-            data = self._load()
-            data.setdefault('users', {})[str(user_id)] = u
-            self._save(data)
-            return {'banned': True, 'reason': 'burst'}
 
         # check per-minute
         if len(mts) > per_minute_limit:

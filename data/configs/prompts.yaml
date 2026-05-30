@@ -50,7 +50,6 @@ tool_using_explanation_prompt: |
   **RESTRICTIONS:**
   * You can not read files from user's device, so if user ask you to analyze content of file, ask them to copy and paste the content in the chat.
   * You can not analyze audio. If user ask you to analyze audio, ask them to provide a transcript or a detailed description of the audio content.
-  * You can not generate images. If user ask you to generate an image, suggest them to use a dedicated image generation model and provide a prompt for it.
 
 memory_merge_prompt: |
   You are a helpful assistant that merges two memory fragments into a single concise memory.

@@ -23,6 +23,7 @@ from imports.utils.logger import get_user_logger, init_logging
 from imports.memory.conversation_store import ConversationStore
 from aiogram.types import BotCommand
 from imports.auth.store import AuthStore
+from imports.stt.whisper_client import WhisperClient, STTBusyError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -238,12 +239,69 @@ orchestrator = Orchestrator(
     conv_store=conv_store,
 )
 
+# STT (Whisper) client — reads GROQ_API_KEY from env
+whisper_client = WhisperClient(CONFIG.get('whisper', {}))
+
 
 # --- Forward Debounce Buffer ---
 # Keeps track of incoming messages per user so we can group them together
 # if they arrive in rapid succession (e.g. forwarded albums).
 _user_buffers: Dict[int, Dict[str, list]] = {}
 _user_flush_tasks: Dict[int, asyncio.Task] = {}
+
+
+async def _download_audio(message: types.Message, user_id: int):
+    """Download a voice message and save it to data/audio/<user_id>/.
+
+    Returns the saved file path string, or None on failure.
+    """
+    voice = message.voice
+    if not voice:
+        return None
+    folder = PROJECT_ROOT / 'data' / 'audio' / str(user_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    file_path = folder / f"{voice.file_unique_id}.ogg"
+    try:
+        await bot.download(voice, destination=str(file_path))
+        get_user_logger(user_id).info("Downloaded voice → %s", file_path)
+        return str(file_path)
+    except Exception as e:
+        get_user_logger(user_id).warning("Failed to download voice: %s", e)
+        return None
+
+
+async def _transcribe_all(paths: list, user_id: int, chat_id: int) -> list:
+    """Transcribe multiple voice files concurrently.
+
+    Returns a list of formatted transcription strings.
+    On STTBusyError, notifies the user and skips that file.
+    On any other error, logs and skips silently.
+    """
+    ulog = get_user_logger(user_id)
+
+    async def _one(path: str):
+        try:
+            text = await whisper_client.transcribe(path)
+            if text and text.strip():
+                return f"[audio message transcription]\n{text.strip()}"
+            return None
+        except STTBusyError:
+            ulog.warning("STT service busy for %s", path)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "🎙 STT service is busy, please try again later.",
+                )
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            ulog.error("Transcription failed for %s: %s", path, e)
+            return None
+
+    results = await asyncio.gather(*[_one(p) for p in paths])
+    return [r for r in results if r is not None]
+
 
 async def _flush_user_buffer(user_id: int, chat_id: int):
     """Wait for a brief debounce period, then submit all accumulated messages and images."""
@@ -254,9 +312,16 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
     
     parts = buffer_data.get("text_parts", [])
     images = buffer_data.get("images", [])
-    
-    if not parts and not images:
+    audio_paths = buffer_data.get("audio_paths", [])
+
+    if not parts and not images and not audio_paths:
         return
+
+    # Transcribe any buffered voice messages first (concurrent, respects STT rate limiter)
+    if audio_paths:
+        transcriptions = await _transcribe_all(audio_paths, user_id, chat_id)
+        # Prepend transcriptions so they appear before any typed text
+        parts = transcriptions + parts
 
     # Combine all accumulated parts into one single message context
     final_text = "\n\n".join(parts)
@@ -436,7 +501,21 @@ async def handle_all(message: types.Message):
                 pass
             bans = auth_store.get_bans(user_id)
             ban_until = bans.get('message_ban_until', 0)
-            await bot.send_message(user_id, f"You are temporarily banned for spamming until {ban_until}.")
+            if ban_until:
+                from datetime import datetime
+                ban_until_str = datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                ban_until_str = "a while"
+            await bot.send_message(user_id, f"You are temporarily banned for spamming until {ban_until_str}.")
+            
+            # Clear user's debounce buffer to drop pending forwarded messages
+            _user_buffers.pop(user_id, None)
+            task = _user_flush_tasks.pop(user_id, None)
+            if task and not task.done():
+                task.cancel()
+            
+            # Stop any running orchestrator task for this user
+            await orchestrator.stop_user(user_id)
             return
     except Exception:
         pass
@@ -449,8 +528,8 @@ async def handle_all(message: types.Message):
             await message.reply('Unknown command')
             return
 
-    # Reject unsupported content types
-    if message.content_type in ("audio", "voice", "video", "document", "video_note", "poll"):
+    # Reject unsupported content types (audio = music/files; voice = ogg voice messages, handled below)
+    if message.content_type in ("audio", "video", "document", "video_note", "poll"):
         await message.reply("Invalid input")
         return
 
@@ -472,6 +551,11 @@ async def handle_all(message: types.Message):
             imgs.append(str(file_path))
         except Exception as e:
             get_user_logger(user_id).warning("Failed to download photo: %s", e)
+
+    # Save voice message if present
+    voice_path = None
+    if message.voice:
+        voice_path = await _download_audio(message, user_id)
 
     # Build forwarded-message context
     forwarded_note = ""
@@ -515,15 +599,17 @@ async def handle_all(message: types.Message):
         await orchestrator.interrupt_user(user_id, "message", user_text, images=imgs if imgs else None)
         return
 
-    if user_text or imgs:
-        # Buffer this message and any images
+    if user_text or imgs or voice_path:
+        # Buffer this message, images, and voice paths
         if user_id not in _user_buffers:
-            _user_buffers[user_id] = {"text_parts": [], "images": []}
-        
+            _user_buffers[user_id] = {"text_parts": [], "images": [], "audio_paths": []}
+
         if user_text:
             _user_buffers[user_id]["text_parts"].append(user_text)
         if imgs:
             _user_buffers[user_id]["images"].extend(imgs)
+        if voice_path:
+            _user_buffers[user_id].setdefault("audio_paths", []).append(voice_path)
 
         # Cancel existing flush task if present to reset the 2.0s timer
         existing_task = _user_flush_tasks.get(user_id)
