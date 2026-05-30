@@ -11,9 +11,9 @@ import html
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
-from imports.config import CONFIG, get_provider, get_bot_config, get_mcp, get_telegram_token
+from imports.config import CONFIG, get_provider, get_bot_config, get_telegram_token
 from imports.providers.lm_studio import LMStudioProvider
 from imports.providers.gemini import GeminiProvider
 from imports.memory.store import MemoryStore
@@ -21,7 +21,6 @@ from imports.mcp.manager import MCPManager
 from imports.orchestrator import Orchestrator
 from imports.utils.logger import get_user_logger, init_logging
 from imports.memory.conversation_store import ConversationStore
-from aiogram.types import BotCommand
 from imports.auth.store import AuthStore
 from imports.stt.whisper_client import WhisperClient, STTBusyError
 
@@ -79,6 +78,10 @@ def _markdown_to_html(text: str) -> str:
     }
     for k, v in latex_reps.items():
         text = re.sub(k, v, text)
+
+    # Clean up math delimiters so expressions display cleanly without raw $ signs
+    text = re.sub(r"\$\$(.*?)\$\$", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)\$(?!\d)(.+?)(?<!\s)\$", r"\1", text)
 
     # 1) Extract fenced code blocks
     code_blocks: dict[str, str] = {}
