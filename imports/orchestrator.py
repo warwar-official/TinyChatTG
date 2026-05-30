@@ -548,7 +548,7 @@ class Orchestrator:
                 # Brief status — show only tool name, no args
                 if self.status_callback:
                     try:
-                        await self.status_callback(chat_id, f"Using: <i><b>{tool_name}</b>...</i>")
+                        await self.status_callback(chat_id, f"⚙️ Using **{tool_name}**...")
                     except Exception:
                         pass
 
@@ -608,7 +608,7 @@ class Orchestrator:
                                 pass
                             if self.status_callback:
                                 try:
-                                    await self.status_callback(chat_id, f"<i><b>{tool_name}</b> declined</i>")
+                                    await self.status_callback(chat_id, f"❌ **{tool_name}** declined.")
                                 except Exception:
                                     pass
                             continue
