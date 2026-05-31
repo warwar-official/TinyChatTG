@@ -107,8 +107,9 @@ def _markdown_to_html(text: str) -> str:
     text = text.replace('—', '–')
 
     # Replace Markdown header markers (#, ##, etc.) at start of line with a chevron
+    # Add a newline before it for better readability
     # Use multiline flag so ^ matches line starts
-    text = re.sub(r'(?m)^\s*#+\s+', '➤ ', text)
+    text = re.sub(r'(?m)^(\s*)#+\s+', r'\n\1➤ ', text)
 
     # Replace unordered list markers '*' or '-' at start of line with a bullet '•'
     text = re.sub(r'(?m)^([ \t]*)[\*-][ \t]+', r"\1• ", text)
@@ -446,8 +447,9 @@ async def cmd_start(message: types.Message):
         return
 
     # print code to server console and log it
-    print(f"Auth code for user {user_id}: {code}")
-    get_user_logger(user_id).info(f"Auth code generated: {code}")
+    nickname = message.from_user.username or message.from_user.full_name or "Unknown"
+    print(f"Auth code for user {user_id} (@{nickname}): {code}")
+    get_user_logger(user_id).info(f"Auth code generated for @{nickname}: {code}")
     await message.answer("Initialization code was printed to server console. Please paste it here to authorize.")
 
 
