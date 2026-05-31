@@ -450,7 +450,7 @@ async def cmd_start(message: types.Message):
     nickname = message.from_user.username or message.from_user.full_name or "Unknown"
     print(f"Auth code for user {user_id} (@{nickname}): {code}")
     get_user_logger(user_id).info(f"Auth code generated for @{nickname}: {code}")
-    await message.answer("Initialization code was printed to server console. Please paste it here to authorize.")
+    await message.answer("Initialization code was printed to server console, message owner (@LordWarWar) for it. Then paste it here to authorize.")
 
 
 @dp.message(Command("new"))
