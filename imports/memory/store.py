@@ -57,16 +57,13 @@ class MemoryStore:
                 self._embed_dim = len(test_vec)
                 self.embed_fn = self._real_embed
                 logger.info("fastembed initialized: model=%s dim=%d", self.embedding_model, self._embed_dim)
-                print(f"[MemoryStore] fastembed initialized: model={self.embedding_model}, dim={self._embed_dim}")
             except Exception as e:
                 logger.warning("fastembed init failed, using pseudo-embeddings: %s", e)
-                print(f"[MemoryStore] WARNING: fastembed init failed ({e}), using pseudo-embeddings")
                 self._fastembed = None
                 self._embed_dim = 384
                 self.embed_fn = self._pseudo_embed
         else:
             logger.warning("fastembed not available, using pseudo-embeddings")
-            print("[MemoryStore] WARNING: fastembed not installed, using pseudo-embeddings")
             self._fastembed = None
             self._embed_dim = 384
             self.embed_fn = self._pseudo_embed
@@ -79,10 +76,8 @@ class MemoryStore:
                 self.qdrant = QdrantClient(path=self.db_path)
                 self._ensure_qdrant_collection()
                 logger.info("Qdrant initialized (path mode): %s", self.db_path)
-                print(f"[MemoryStore] Qdrant initialized: {self.db_path}")
             except Exception as e:
                 logger.warning("Qdrant init failed, using JSON fallback: %s", e)
-                print(f"[MemoryStore] WARNING: Qdrant init failed ({e}), using JSON fallback")
                 self.qdrant = None
 
         # register close handler to avoid Qdrant shutdown issues

@@ -5,14 +5,14 @@ This repository implements a lightweight Telegram AI assistant that runs against
 **Quick summary**
 - Local LM Studio provider adapter and chat wrapper.
 - Persistent conversation store and memory (Qdrant + fastembed primary, JSON fallback).
-- Orchestrator with primary/secondary queues, tool discovery, and approval flow.
+ - Orchestrator with a unified queue, tool discovery, and approval flow.
 - Telegram bot with `/start` (auth), `/new` (extract+clear), command registration, message-rate bans, and safer unknown-command handling.
 
 **Implemented features (what's in the code today)**
 
 - **Providers** — Adapters for both LM Studio and Gemini implemented in [imports/providers/](imports/providers/). They provide async `chat()` wrappers and handle provider-specific responses.
 - **Orchestrator** — Central request flow in [imports/orchestrator.py](imports/orchestrator.py):
-  - Primary queue for inbound user messages and secondary queue for background tasks (summarization, extraction, tool results).
+  - Unified queue for inbound user messages and background tasks (summarization, extraction, tool results).
   - Strict concurrency limits (semaphores) and RPM limits logic.
   - Integrates `ConversationStore` for persistent context and triggers summarization/extraction when conversation length exceeds limits.
   - Full tool-call loop execution, supporting both local tools and MCP tools.
@@ -83,7 +83,7 @@ pytest -q
 
 **TODO (extracted from PROJECT_CONCEPT.md)**
 
-- Implement modality fallbacks (e.g. use an image description model if the main model does not support multimodal input).
+- Consider modality fallbacks; current approach assumes models handle multimodal inputs directly.
 - Implement robust retry mechanisms and fallback models for handling provider errors (503/429).
 - Document setup for optional local services (LM Studio, TinyMCP, Qdrant, fastembed).
 

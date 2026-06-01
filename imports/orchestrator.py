@@ -10,6 +10,9 @@ from typing import Any, Dict, Optional, Callable, List
 
 import yaml
 from imports.utils.logger import get_user_logger
+from imports.config import get_provider
+from imports.providers.gemini import GeminiProvider
+from imports.providers.lm_studio import LMStudioProvider
 
 from imports.tools.remember_info import add_memory as mm_add
 from imports.tools.recall_info import search_memory as ms_search
@@ -53,7 +56,6 @@ class Orchestrator:
         self.conv_store = conv_store
 
         self.primary_queue: asyncio.Queue = asyncio.Queue()
-        self.secondary_queue: asyncio.Queue = asyncio.Queue()
 
         # Concurrency & rate limit configuration
         concurrency_conf = (self.config or {}).get('concurrency', {})
@@ -69,6 +71,10 @@ class Orchestrator:
         self._user_job_tasks: Dict[int, asyncio.Task] = {}  # user_id -> in-flight task
         self._user_interrupt: Dict[int, dict] = {}          # user_id -> {type, text, images}
         self._stopped_users: set = set()                    # users whose queued jobs should be skipped
+        # Pending jobs persisted across restarts
+        self._pending_primary_jobs: list = []
+        # Path to state file (can be overridden in tests)
+        self._state_path = Path(__file__).resolve().parents[1] / 'data' / 'state' / 'orchestrator_state.json'
 
         self.tools = {'tools': {}}
         if self.mcp_mgr:
@@ -106,11 +112,11 @@ class Orchestrator:
             self.tools = self.mcp_mgr.get_all_tools()
         concurrency_conf = (self.config or {}).get('concurrency', {})
         primary_workers = concurrency_conf.get('primary_workers', 1)
-        secondary_workers = concurrency_conf.get('secondary_workers', 1)
-        for _ in range(primary_workers):
+        secondary_workers = concurrency_conf.get('secondary_workers', 0)
+        # Use a single unified queue; total workers equal sum of configured workers
+        total_workers = max(1, int(primary_workers) + int(secondary_workers))
+        for _ in range(total_workers):
             self._tasks.append(asyncio.create_task(self._primary_worker()))
-        for _ in range(secondary_workers):
-            self._tasks.append(asyncio.create_task(self._secondary_worker()))
 
     async def stop(self):
         for t in self._tasks:
@@ -127,21 +133,77 @@ class Orchestrator:
         except Exception:
             pass
 
+    async def save_state(self):
+        """Persist pending primary jobs to disk (JSON)."""
+        try:
+            state_path = Path(getattr(self, '_state_path', None) or self._state_path)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {'pending_primary_jobs': self._pending_primary_jobs}
+            with open(state_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning("Failed to save orchestrator state: %s", e)
+
+    async def _load_state(self):
+        """Load persisted pending jobs and enqueue them."""
+        try:
+            state_path = getattr(self, '_state_path', None)
+            if not state_path:
+                return
+            state_path = Path(state_path)
+            if not state_path.exists():
+                return
+            with open(state_path, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+            jobs = data.get('pending_primary_jobs') or []
+            self._pending_primary_jobs = jobs
+            for job in jobs:
+                try:
+                    await self.primary_queue.put(job)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("Failed to load orchestrator state: %s", e)
+
     async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
-        await self.primary_queue.put({
-            "user_id": int(user_id), 
-            "chat_id": int(chat_id), 
-            "text": text, 
-            "images": images, 
-            "future": fut
-        })
-        return await fut
+        # Persist a JSON-serializable record of the pending job (without future)
+        job_record = {"user_id": int(user_id), "chat_id": int(chat_id), "text": text, "images": images}
+        # Keep the record in pending list for state persistence
+        try:
+            self._pending_primary_jobs.append(job_record)
+        except Exception:
+            self._pending_primary_jobs = [job_record]
+        # Persist state asynchronously
+        try:
+            asyncio.create_task(self.save_state())
+        except Exception:
+            pass
+
+        # Enqueue the actual job including the future and a reference to the persisted record
+        await self.primary_queue.put({**job_record, "future": fut, "_persist": job_record})
+        res = await fut
+        return res
 
     async def _primary_worker(self):
         while True:
             job = await self.primary_queue.get()
+
+            # Handle background coroutine jobs enqueued without a future
+            if isinstance(job, dict) and job.get('coro') is not None and not job.get('future'):
+                try:
+                    coro = job.get('coro')
+                    if asyncio.iscoroutine(coro):
+                        await coro
+                    elif callable(coro):
+                        res = coro()
+                        if asyncio.iscoroutine(res):
+                            await res
+                except Exception as e:
+                    logger.warning("Background job error: %s", e)
+                continue
+
             fut = job.get('future')
             user_id = job.get('user_id')
 
@@ -163,6 +225,22 @@ class Orchestrator:
                 finally:
                     if user_id and self._user_job_tasks.get(user_id) is task:
                         self._user_job_tasks.pop(user_id, None)
+                # Remove persisted record if present
+                try:
+                    persist = job.get('_persist')
+                    if persist and persist in self._pending_primary_jobs:
+                        try:
+                            self._pending_primary_jobs.remove(persist)
+                        except Exception:
+                            pass
+                        # Persist updated state asynchronously
+                        try:
+                            asyncio.create_task(self.save_state())
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 if fut and not fut.done():
                     fut.set_result(res)
             except Exception as e:
@@ -170,17 +248,7 @@ class Orchestrator:
                 if fut and not fut.done():
                     fut.set_exception(e)
 
-    async def _secondary_worker(self):
-        while True:
-            job = await self.secondary_queue.get()
-            try:
-                coro = job.get('coro')
-                if asyncio.iscoroutine(coro):
-                    await coro
-                elif callable(coro):
-                    await coro()
-            except Exception as e:
-                logger.warning("Secondary worker error: %s", e)
+    # Background coroutines are now processed by primary workers via jobs with a 'coro' key.
 
     async def approval_response(self, approval_id: str, approved: bool):
         fut = self.pending_approvals.get(approval_id)
@@ -231,6 +299,84 @@ class Orchestrator:
                 wait_time = 60 - (now - oldest)
             # sleep outside the lock to allow other coroutines to progress
             await asyncio.sleep(min(wait_time, 1))
+
+    async def _call_provider_chat(self, provider_inst, messages, functions=None, timeout: int = 300):
+        """Call provider.chat with rate-limiting and semaphore, return response or {'error': ...} on exception."""
+        try:
+            await self._acquire_rate_slot()
+            async with self.model_semaphore:
+                # Some providers accept tools kw only when provided
+                return await provider_inst.chat(messages, tools=functions if functions else None, timeout=timeout)
+        except Exception as e:
+            logger.exception("Provider chat raised exception: %s", e)
+            return {"error": str(e)}
+
+    async def _chat_with_fallback(self, messages, functions=None, user_id: Optional[int] = None, timeout: int = 300):
+        """Call primary provider and fallback to backup model on error.
+
+        Returns the provider response dict or {'error': ...} on failure.
+        """
+        # Call primary
+        resp = await self._call_provider_chat(self.provider, messages, functions, timeout=timeout)
+        if resp and not (isinstance(resp, dict) and resp.get('error')):
+            return resp
+
+        primary_err = (resp.get('error') if isinstance(resp, dict) else 'empty response from model')
+        logger.error("Primary model error: %s", primary_err)
+        if user_id:
+            try:
+                get_user_logger(user_id).error("Primary model error: %s", primary_err)
+            except Exception:
+                pass
+
+        backup_cfg = (self.config or {}).get('models', {}).get('backup_model')
+        if not backup_cfg:
+            return {"error": primary_err}
+
+        try:
+            backup_provider = self._build_provider_from_model_cfg(backup_cfg)
+            if not backup_provider:
+                return {"error": primary_err}
+            resp2 = await self._call_provider_chat(backup_provider, messages, functions, timeout=timeout)
+            if resp2 and not (isinstance(resp2, dict) and resp2.get('error')):
+                logger.info("Backup model succeeded")
+                if user_id:
+                    try:
+                        get_user_logger(user_id).info("Backup model used for this request")
+                    except Exception:
+                        pass
+                return resp2
+            backup_err = (resp2.get('error') if isinstance(resp2, dict) else 'empty response from backup model')
+            logger.error("Backup model error: %s", backup_err)
+            if user_id:
+                try:
+                    get_user_logger(user_id).error("Backup model error: %s", backup_err)
+                except Exception:
+                    pass
+            return {"error": backup_err}
+        except Exception as e:
+            logger.exception("Backup model attempt failed: %s", e)
+            return {"error": str(e)}
+
+    def _build_provider_from_model_cfg(self, model_cfg: Dict[str, Any]):
+        """Instantiate a provider object from a models.* config dict.
+
+        This intentionally does NOT read sensitive keys like API keys from
+        config files; providers should pick up credentials from the
+        environment when possible.
+        """
+        if not model_cfg or not isinstance(model_cfg, dict):
+            return None
+        provider_name = model_cfg.get('provider', 'lmstudio')
+        model_name = model_cfg.get('model') or (get_provider(provider_name) or {}).get('default_model')
+        if provider_name == 'gemini':
+            # Do NOT read API key from config here — GeminiProvider will use env var if available
+            return GeminiProvider(default_model=model_name)
+        else:
+            # default to LM Studio provider
+            prov_cfg = get_provider('lmstudio') or {}
+            url = prov_cfg.get('url') or 'http://127.0.0.1:1234'
+            return LMStudioProvider(url, model_name or prov_cfg.get('default_model', 'default_model'))
 
     # ─── Context Assembly ───────────────────────────────────────────────
 
@@ -437,7 +583,7 @@ class Orchestrator:
             try:
                 history = self.conv_store.get_history(user_id)
                 convo_copy = list(history)
-                await self.secondary_queue.put({"coro": self._summarize_and_extract(user_id, convo_copy)})
+                await self.primary_queue.put({"coro": self._summarize_and_extract(user_id, convo_copy)})
             except Exception as e:
                 ulog.error("Failed to schedule summarization: %s", e)
 
@@ -470,10 +616,8 @@ class Orchestrator:
                 except Exception:
                     pass
 
-            # Rate limiting + semaphore for model calls
-            await self._acquire_rate_slot()
-            async with self.model_semaphore:
-                resp = await self.provider.chat(messages, tools=functions if functions else None)
+            # Call provider with automatic fallback to backup model on error
+            resp = await self._chat_with_fallback(messages, functions, user_id=user_id)
 
             if not resp:
                 return {"error": "empty response from model"}
@@ -635,7 +779,7 @@ class Orchestrator:
 
                 # If tool result is long, schedule summarization on secondary queue
                 if len(text_result) > 3000:
-                    await self.secondary_queue.put({
+                    await self.primary_queue.put({
                         "coro": self._summarize_tool_result(user_id, tool_name, text_result)
                     })
 
@@ -712,10 +856,7 @@ class Orchestrator:
                     tool_name=tool_name, tool_result=tool_result
                 )},
             ]
-            await self._acquire_rate_slot()
-            async with self.model_semaphore:
-                resp = await self.provider.chat(summary_msgs)
-
+            resp = await self._chat_with_fallback(summary_msgs, user_id=user_id)
             summary = self._extract_text_from_response(resp)
             if not summary:
                 return
@@ -769,9 +910,7 @@ class Orchestrator:
                 {"role": "system", "content": self.conversation_summarize_prompt},
                 {"role": "user", "content": conv_text},
             ]
-            await self._acquire_rate_slot()
-            async with self.model_semaphore:
-                summ_resp = await self.provider.chat(summary_msgs)
+            summ_resp = await self._chat_with_fallback(summary_msgs, user_id=user_id)
             summary = _strip_thinking(self._extract_text_from_response(summ_resp))
         except Exception as e:
             ulog.warning("Summarization failed, using truncation: %s", e)
@@ -784,9 +923,7 @@ class Orchestrator:
                 {"role": "system", "content": self.fact_extraction_prompt},
                 {"role": "user", "content": conv_text},
             ]
-            await self._acquire_rate_slot()
-            async with self.model_semaphore:
-                ex_resp = await self.provider.chat(extract_msgs)
+            ex_resp = await self._chat_with_fallback(extract_msgs, user_id=user_id)
             content = _strip_thinking(self._extract_text_from_response(ex_resp))
             
             # Remove markdown backticks if present
@@ -882,14 +1019,13 @@ class Orchestrator:
                 {"role": "system", "content": merge_prompt},
                 {"role": "user", "content": merge_template.format(existing=existing, new=new)},
             ]
-            await self._acquire_rate_slot()
-            
             for _ in range(3):
                 try:
-                    async with self.model_semaphore:
-                        resp = await self.provider.chat(msgs)
+                    resp = await self._chat_with_fallback(msgs)
+                    # If provider returned an error dict, treat as retryable failure
+                    if isinstance(resp, dict) and resp.get('error'):
+                        raise Exception(resp.get('error'))
                     content = self._extract_text_from_response(resp) or ""
-                    
                     if not content.strip():
                         continue
                         

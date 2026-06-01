@@ -9,6 +9,7 @@ from typing import Dict, Any
 import re
 import html
 
+import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -143,6 +144,7 @@ else:
     bot = Bot(token=TELEGRAM_TOKEN)
 
 dp = Dispatcher()
+logger = logging.getLogger(__name__)
 
 def _build_provider():
     """Instantiate the correct AI provider based on app_config.yaml → models.main_model."""
@@ -151,14 +153,14 @@ def _build_provider():
 
     if provider_name == 'gemini':
         prov_cfg = get_provider('gemini') or {}
-        api_key = os.environ.get('GEMINI_API_KEY') or prov_cfg.get('api_key') or ''
+        # Do NOT read API key from config; prefer environment variable only.
         model = main_model_cfg.get('model') or prov_cfg.get('default_model') or 'gemini-2.0-flash'
-        return GeminiProvider(api_key=api_key, default_model=model)
+        return GeminiProvider(default_model=model)
 
     # default: lmstudio
     prov_cfg = get_provider('lmstudio') or {}
     return LMStudioProvider(
-        prov_cfg.get('url', 'http://192.168.50.212:1234'),
+        prov_cfg.get('url') or 'http://192.168.50.212:1234',
         prov_cfg.get('default_model', 'default_model'),
     )
 
@@ -446,9 +448,14 @@ async def cmd_start(message: types.Message):
         get_user_logger(user_id).warning(f"code generation blocked: {err}")
         return
 
-    # print code to server console and log it
-    nickname = message.from_user.username or message.from_user.full_name or "Unknown"
-    print(f"Auth code for user {user_id} (@{nickname}): {code}")
+    # log code generation (robust lookup of user display name)
+    nickname = (
+        getattr(message.from_user, 'username', None)
+        or getattr(message.from_user, 'full_name', None)
+        or getattr(message.from_user, 'first_name', None)
+        or str(getattr(message.from_user, 'id', 'Unknown'))
+    )
+    logger.info(f"Auth code for user {user_id} (@{nickname}): {code}")
     get_user_logger(user_id).info(f"Auth code generated for @{nickname}: {code}")
     await message.answer("Initialization code was printed to server console, message owner (@LordWarWar) for it. Then paste it here to authorize.")
 
@@ -657,9 +664,9 @@ async def main():
         if mcp_mgr:
             mcp_mgr.start()
             for r in mcp_mgr.reports:
-                print(f"[MCP Report] {r}")
+                logger.info("[MCP Report] %s", r)
     except Exception as e:
-        print("MCP start failed:", e)
+        logger.exception("MCP start failed: %s", e)
 
     # Register bot commands (if real bot)
     try:
@@ -675,9 +682,8 @@ async def main():
     try:
         await orchestrator.start()
     except Exception as e:
-        print("Orchestrator start failed:", e)
-
-    print("Bot started. Waiting for messages...")
+        logger.exception("Orchestrator start failed: %s", e)
+    logger.info("Bot started. Waiting for messages...")
     try:
         await dp.start_polling(bot)
     finally:

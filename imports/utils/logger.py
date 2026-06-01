@@ -10,6 +10,8 @@ def get_user_logger(user_id: int, logs_path: str = "logs") -> logging.Logger:
         formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         fh.setFormatter(formatter)
         logger.addHandler(fh)
+        # Per-user logs should not propagate to app root logger to avoid duplication
+        logger.propagate = False
         logger.setLevel(logging.DEBUG)
     return logger
 
@@ -21,8 +23,34 @@ def init_logging(config: dict | None = None):
     Path(logs_path).mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     if not root.handlers:
+        # Main application log: only INFO and above
         fh = logging.FileHandler(Path(logs_path) / 'app.log', encoding='utf-8')
+        fh.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
         fh.setFormatter(formatter)
         root.addHandler(fh)
-    root.setLevel(logging.DEBUG if debug else logging.INFO)
+        # If debug enabled, add a separate debug file with detailed traces
+        if debug:
+            fh_dbg = logging.FileHandler(Path(logs_path) / 'app_debug.log', encoding='utf-8')
+            fh_dbg.setLevel(logging.DEBUG)
+            dbg_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            fh_dbg.setFormatter(dbg_formatter)
+            root.addHandler(fh_dbg)
+        # Root logger set to DEBUG so debug handler can capture detailed logs,
+        # but `app.log` will only receive INFO+ due to its handler level.
+        root.setLevel(logging.DEBUG)
+        # Add a console handler so logs are visible on the terminal
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG if debug else logging.INFO)
+        ch.setFormatter(formatter)
+        root.addHandler(ch)
+    else:
+        # Ensure there's a console handler present with appropriate level
+        has_console = any(isinstance(h, logging.StreamHandler) for h in root.handlers)
+        if not has_console:
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.DEBUG if debug else logging.INFO)
+            # use same formatter style as file handlers
+            formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            ch.setFormatter(formatter)
+            root.addHandler(ch)
