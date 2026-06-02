@@ -81,7 +81,7 @@ def _markdown_to_html(text: str) -> str:
     if not text:
         return text
 
-    # LaTeX arrow replacements
+    # 1) LaTeX arrow replacements
     latex_reps = {
         r"\\rightarrow\b": "→",
         r"\\leftarrow\b": "←",
@@ -98,9 +98,47 @@ def _markdown_to_html(text: str) -> str:
     for k, v in latex_reps.items():
         text = re.sub(k, v, text)
 
-    # Clean up math delimiters so expressions display cleanly without raw $ signs
+    # 2) Math symbol replacements
+    math_symbols = {
+        r"\\sim\b": "~",
+        r"\\le\b": "≤",
+        r"\\ge\b": "≥",
+        r"\\leq\b": "≤",
+        r"\\geq\b": "≥",
+        r"\\approx\b": "≈",
+        r"\\neq\b": "≠",
+        r"\\%": "%",
+        r"\\times\b": "×",
+        r"\\div\b": "÷",
+        r"\\pm\b": "±",
+        r"\\cdot\b": "·",
+        r"\\degree\b": "°",
+    }
+    for k, v in math_symbols.items():
+        text = re.sub(k, v, text)
+
+    # 3) \text{...} replacement
+    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
+
+    # 4) Clean up double dollars
     text = re.sub(r"\$\$(.*?)\$\$", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\w)\$(?!\d)(.+?)(?<!\s)\$", r"\1", text)
+
+    # 5) Clean up single dollars
+    def _cb_single_dollar(m):
+        content = m.group(1)
+        contains_math_op = any(op in content for op in ('+', '-', '*', '/', '=', '<', '>', '^', '_', '~', '≤', '≥', '≈', '≠', '±', '·', '°', '×', '÷', '%'))
+        is_short = len(content.strip()) <= 5 and ' ' not in content.strip()
+        
+        words = set(re.findall(r'\b[a-zA-Z]+\b', content.lower()))
+        has_stopwords = bool(words & {'and', 'or', 'the', 'is', 'of', 'to', 'for', 'in', 'with', 'on', 'at', 'by', 'an', 'a'})
+        
+        if contains_math_op or (is_short and len(content.strip()) > 0) or (not has_stopwords and len(content.strip()) > 0):
+            return content
+        else:
+            return f"${content}$"
+            
+    text = re.sub(r"\$([^\$]+?)\$", _cb_single_dollar, text)
+
 
     # 1) Extract fenced code blocks
     code_blocks: dict[str, str] = {}

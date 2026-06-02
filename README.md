@@ -30,6 +30,17 @@ This repository implements a lightweight Telegram AI assistant that runs against
   - Real-time tool execution status updates sent to the chat.
 - **AuthStore** — persistent auth, start/code bans, and message-rate limits (spam protection).
 - **Logging** — app and per-user logs via [imports/utils/logger.py](imports/utils/logger.py).
+- **File Processing** — Handles files sent to the bot:
+  - **Images**: Automatically compressed to a maximum of 2 megapixels (2MP) and forwarded to the model context.
+  - **Text-based files** (`.txt`, `.md`, `.py`, `.js`, etc.): Stored under `data/documents/<user_id>/`. If <= 15,000 characters, the content is shown in context. Otherwise, the model is notified to use tools to read/search the file.
+  - **Unsupported files / media**: Rejects other file types (e.g. PDFs, binary, video, music) with `"File type does not suported"`.
+  - **Size limit**: Restricts files to a maximum of 2MB.
+- **File Interaction Tools** — Exposes three new local tools for the model:
+  - `file_list` — Lists user's stored text files from newest to oldest.
+  - `file_read_lines` — Returns a paginated range of lines from a file.
+  - `file_search` — Searches for a query string in a file and returns matching lines and snippets (capped at 50 results).
+  - Includes strict path-traversal validation (rejecting `/`, `\\`, and `..` to restrict the model to the user's folder).
+
 
 - **Config & data locations**
   - Main config: [data/configs/app_config.yaml](data/configs/app_config.yaml)
