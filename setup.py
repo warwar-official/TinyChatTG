@@ -46,6 +46,62 @@ DEFAULT_TOOLS_YAML = """tools:
           type: "string"
           description: "Search query"
       required: ["query"]
+
+  scratchpad_add_record:
+    visible: true
+    description: "Append a new line to your private scratchpad. The scratchpad is always visible in your system context."
+    permissions: "auto"
+    _provider: "app"
+    handler: "scratchpad_add.add_record"
+    schema:
+      type: "object"
+      properties:
+        text:
+          type: "string"
+          description: "Text of the new scratchpad line."
+      required: ["text"]
+
+  scratchpad_remove_record:
+    visible: true
+    description: "Remove a line from the scratchpad by its line number (1-based)."
+    permissions: "auto"
+    _provider: "app"
+    handler: "scratchpad_remove.remove_record"
+    schema:
+      type: "object"
+      properties:
+        record_id:
+          type: "integer"
+          description: "Line number to remove (1-based)."
+      required: ["record_id"]
+
+  scratchpad_update_record:
+    visible: true
+    description: "Replace the text of an existing scratchpad line."
+    permissions: "auto"
+    _provider: "app"
+    handler: "scratchpad_update.update_record"
+    schema:
+      type: "object"
+      properties:
+        record_id:
+          type: "integer"
+          description: "Line number to update (1-based)."
+        text:
+          type: "string"
+          description: "New text for the line."
+      required: ["record_id", "text"]
+
+  scratchpad_wipe_records:
+    visible: true
+    description: "Remove all lines from the scratchpad."
+    permissions: "auto"
+    _provider: "app"
+    handler: "scratchpad_wipe.wipe_records"
+    schema:
+      type: "object"
+      properties: {}
+      required: []
 """
 
 def print_status(msg, status="INFO"):

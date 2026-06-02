@@ -36,6 +36,13 @@ class ConversationStore:
                     updated_at REAL NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scratchpads (
+                    user_id INTEGER PRIMARY KEY,
+                    lines TEXT NOT NULL DEFAULT '[]',
+                    updated_at REAL NOT NULL
+                )
+            """)
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -138,3 +145,37 @@ class ConversationStore:
                 (int(user_id),),
             ).fetchone()
         return row['summary'] if row else ''
+
+    # ── Scratchpad ────────────────────────────────────────────────────────
+
+    def get_scratchpad(self, user_id: int) -> list:
+        """Return the scratchpad lines for a user as a list of strings."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT lines FROM scratchpads WHERE user_id = ?",
+                (int(user_id),),
+            ).fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row['lines'])
+        except Exception:
+            return []
+
+    def set_scratchpad(self, user_id: int, lines: list) -> None:
+        """Atomically replace the scratchpad for a user."""
+        now = time.time()
+        lines_json = json.dumps(lines, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO scratchpads (user_id, lines, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET lines = excluded.lines, updated_at = excluded.updated_at""",
+                (int(user_id), lines_json, now),
+            )
+            conn.commit()
+
+    def get_scratchpad_char_count(self, user_id: int) -> int:
+        """Return the total character count of the scratchpad content."""
+        lines = self.get_scratchpad(user_id)
+        return len('\n'.join(lines)) if lines else 0

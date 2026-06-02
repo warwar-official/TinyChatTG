@@ -16,6 +16,10 @@ from imports.providers.lm_studio import LMStudioProvider
 
 from imports.tools.remember_info import add_memory as mm_add
 from imports.tools.recall_info import search_memory as ms_search
+from imports.tools.scratchpad_add import add_record as sp_add
+from imports.tools.scratchpad_remove import remove_record as sp_remove
+from imports.tools.scratchpad_update import update_record as sp_update
+from imports.tools.scratchpad_wipe import wipe_records as sp_wipe
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,8 @@ class Orchestrator:
         self.tools = {'tools': {}}
         if self.mcp_mgr:
             self.tools = self.mcp_mgr.get_all_tools()
+        if 'tools' not in self.tools:
+            self.tools['tools'] = {}
             
         # conversation storage for per-user context
         if self.conv_store is None:
@@ -420,13 +426,25 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Failed to search memories for user %d: %s", user_id, e)
 
+        scratchpad_section = ""
+        try:
+            sp_lines = self.conv_store.get_scratchpad(user_id)
+            if sp_lines:
+                numbered = '\n'.join(f"{i + 1}: {line}" for i, line in enumerate(sp_lines))
+                scratchpad_section = f"[Scratchpad]\n{numbered}\n"
+            else:
+                scratchpad_section = "[Scratchpad]\n[]\n"
+        except Exception as e:
+            logger.warning("Failed to get scratchpad for user %d: %s", user_id, e)
+
         # Build final system content using the template
         sys_content = self.context_template.format(
             personality=self.personality_prompt,
             tool_using_explanation=self.tool_using_explanation_prompt,
             runtime_time=now_str,
             summary_section=summary_section,
-            memories_section=memories_section
+            memories_section=memories_section,
+            scratchpad_section=scratchpad_section
         ).strip()
 
         messages.append({"role": "system", "content": sys_content})
@@ -802,19 +820,29 @@ class Orchestrator:
         provider = tool_conf.get('_provider')
         if provider == 'app':
             handler = tool_conf.get('handler')
-            if handler and 'remember_info' in handler:
+            dispatch = {
+                'remember_info.add_memory': lambda: mm_add(self.mem_store, user_id, tool_args),
+                'recall_info.search_memory': lambda: ms_search(self.mem_store, user_id, tool_args),
+                'scratchpad_add.add_record': lambda: sp_add(self.conv_store, user_id, tool_args),
+                'scratchpad_remove.remove_record': lambda: sp_remove(self.conv_store, user_id, tool_args),
+                'scratchpad_update.update_record': lambda: sp_update(self.conv_store, user_id, tool_args),
+                'scratchpad_wipe.wipe_records': lambda: sp_wipe(self.conv_store, user_id, tool_args),
+            }
+            fn = dispatch.get(handler)
+            # Fallback for older configs without the full module.function name
+            if not fn and handler:
+                if 'remember_info' in handler:
+                    fn = lambda: mm_add(self.mem_store, user_id, tool_args)
+                elif 'memory_search' in handler or 'recall_info' in handler:
+                    fn = lambda: ms_search(self.mem_store, user_id, tool_args)
+                    
+            if fn:
                 try:
-                    return mm_add(self.mem_store, user_id, tool_args)
+                    return fn()
                 except Exception as e:
                     ulog.error("Local tool '%s' failed: %s", tool_name, e)
                     return {"error": str(e)}
-            elif handler and 'memory_search' in handler:
-                try:
-                    return ms_search(self.mem_store, user_id, tool_args)
-                except Exception as e:
-                    ulog.error("Local tool '%s' failed: %s", tool_name, e)
-                    return {"error": str(e)}
-            return {"error": "Unknown local app tool handler"}
+            return {"error": f"Unknown local app tool handler: {handler}"}
         else:
             try:
                 if self.mcp_mgr:
