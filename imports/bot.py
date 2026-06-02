@@ -8,6 +8,24 @@ from pathlib import Path
 from typing import Dict, Any
 import re
 import html
+import math
+from PIL import Image
+
+def compress_image_to_2mp(image_path: str) -> None:
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            total_pixels = width * height
+            if total_pixels > 2000000:
+                scale = math.sqrt(2000000 / total_pixels)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+                resized_img = img.resize((new_width, new_height), resample=resample_filter)
+                resized_img.save(image_path, format=img.format or 'JPEG')
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Error compressing image {image_path}: {e}")
+
 
 import logging
 from aiogram import Bot, Dispatcher, types
@@ -557,9 +575,14 @@ async def handle_all(message: types.Message):
             await message.reply('Unknown command')
             return
 
-    # Reject unsupported content types (audio = music/files; voice = ogg voice messages, handled below)
-    if message.content_type in ("audio", "video", "document", "video_note", "poll"):
+    # Handle video_note, poll and other non-file/non-document unsupported content types
+    if message.content_type in ("video_note", "poll"):
         await message.reply("Invalid input")
+        return
+
+    # For audio and video, they are file types that are not supported.
+    if message.content_type in ("audio", "video"):
+        await message.reply("File type does not suported")
         return
 
     # Save images if present
@@ -580,6 +603,64 @@ async def handle_all(message: types.Message):
             imgs.append(str(file_path))
         except Exception as e:
             get_user_logger(user_id).warning("Failed to download photo: %s", e)
+
+    # Process documents
+    file_context = ""
+    if message.document:
+        doc = message.document
+        if doc.file_size > 2 * 1024 * 1024:
+            await message.reply("File is too big")
+            return
+
+        orig_name = doc.file_name or "file"
+        clean_name = Path(orig_name).name
+        file_ext = Path(clean_name).suffix.lower()
+        mime_type = doc.mime_type or ""
+
+        image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+        text_extensions = {
+            '.txt', '.md', '.html', '.htm', '.py', '.js', '.css', '.json', '.xml', 
+            '.csv', '.yaml', '.yml', '.ini', '.conf', '.log', '.sh', '.bat', '.ts', 
+            '.tsx', '.jsx', '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.php', 
+            '.sql', '.rb', '.pl', '.pm'
+        }
+
+        is_image = mime_type.startswith('image/') or file_ext in image_extensions
+        is_text = mime_type.startswith('text/') or file_ext in text_extensions or mime_type in {'application/json', 'application/xml', 'application/javascript', 'application/x-javascript'}
+
+        if is_image:
+            folder = PROJECT_ROOT / 'data' / 'images' / str(user_id)
+            folder.mkdir(parents=True, exist_ok=True)
+            file_path = folder / f"{doc.file_unique_id}{file_ext}"
+            try:
+                await bot.download(doc, destination=str(file_path))
+                compress_image_to_2mp(str(file_path))
+                imgs.append(str(file_path))
+            except Exception as e:
+                get_user_logger(user_id).warning("Failed to download image file: %s", e)
+                await message.reply("Failed to download image.")
+                return
+        elif is_text:
+            folder = PROJECT_ROOT / 'data' / 'documents' / str(user_id)
+            folder.mkdir(parents=True, exist_ok=True)
+            file_path = folder / clean_name
+            try:
+                await bot.download(doc, destination=str(file_path))
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content_str = f.read()
+                
+                num_chars = len(content_str)
+                if num_chars <= 15000:
+                    file_context = f"[File from user: {clean_name}]\n{content_str}"
+                else:
+                    file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
+            except Exception as e:
+                get_user_logger(user_id).warning("Failed to process text file: %s", e)
+                await message.reply("Failed to process text file.")
+                return
+        else:
+            await message.reply("File type does not suported")
+            return
 
     # Save voice message if present
     voice_path = None
@@ -618,6 +699,8 @@ async def handle_all(message: types.Message):
         parts.append(forwarded_note.strip())
     if imgs:
         parts.append("[image attached]")
+    if file_context:
+        parts.append(file_context)
     if raw_text:
         parts.append(raw_text)
 

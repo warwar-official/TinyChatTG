@@ -17,92 +17,139 @@ DIRS = [
 # Default tools config
 DEFAULT_TOOLS_YAML = """tools:
   remember_info:
-    visible: true
-    description: "Store an important fact or preference about the user into the long-term memory."
-    permissions: "auto"
-    _provider: "app"
-    handler: "remember_info"
+    description: Manually add memory entry to the memory store to remember facts or user preferences. Text must be between 50 and 350 characters long and contain alphabetical letters.
+    handler: remember_info.add_memory
+    require_approval: false
     schema:
-      type: "object"
       properties:
-        fact:
-          type: "string"
-          description: "The fact to remember"
+        text:
+          type: string
         title:
-          type: "string"
-          description: "Title of the fact"
-      required: ["fact", "title"]
-
-  recall_info:
+          type: string
+      required:
+      - text
+      - title
+      type: object
     visible: true
-    description: "Search long-term memory for facts and preferences."
-    permissions: "auto"
-    _provider: "app"
-    handler: "memory_search"
+  recall_info:
+    description: Search the user's memory store to recall facts, user preferences, or past conversation summaries
+    handler: recall_info.search_memory
+    require_approval: false
     schema:
-      type: "object"
       properties:
         query:
-          type: "string"
-          description: "Search query"
-      required: ["query"]
-
+          type: string
+          description: Search query
+        limit:
+          type: integer
+          description: Max number of results to return
+      required:
+      - query
+      type: object
+    visible: true
   scratchpad_add_record:
-    visible: true
-    description: "Append a new line to your private scratchpad. The scratchpad is always visible in your system context."
-    permissions: "auto"
-    _provider: "app"
-    handler: "scratchpad_add.add_record"
+    description: Append a new line to your private scratchpad. The scratchpad is always visible in your system context.
+    handler: scratchpad_add.add_record
+    require_approval: false
     schema:
-      type: "object"
       properties:
         text:
-          type: "string"
-          description: "Text of the new scratchpad line."
-      required: ["text"]
-
+          type: string
+          description: Text of the new scratchpad line.
+      required:
+      - text
+      type: object
+    visible: true
   scratchpad_remove_record:
-    visible: true
-    description: "Remove a line from the scratchpad by its line number (1-based)."
-    permissions: "auto"
-    _provider: "app"
-    handler: "scratchpad_remove.remove_record"
+    description: Remove a line from the scratchpad by its line number (1-based).
+    handler: scratchpad_remove.remove_record
+    require_approval: false
     schema:
-      type: "object"
       properties:
         record_id:
-          type: "integer"
-          description: "Line number to remove (1-based)."
-      required: ["record_id"]
-
+          type: integer
+          description: Line number to remove (1-based).
+      required:
+      - record_id
+      type: object
+    visible: true
   scratchpad_update_record:
-    visible: true
-    description: "Replace the text of an existing scratchpad line."
-    permissions: "auto"
-    _provider: "app"
-    handler: "scratchpad_update.update_record"
+    description: Replace the text of an existing scratchpad line.
+    handler: scratchpad_update.update_record
+    require_approval: false
     schema:
-      type: "object"
       properties:
         record_id:
-          type: "integer"
-          description: "Line number to update (1-based)."
+          type: integer
+          description: Line number to update (1-based).
         text:
-          type: "string"
-          description: "New text for the line."
-      required: ["record_id", "text"]
-
-  scratchpad_wipe_records:
+          type: string
+          description: New text for the line.
+      required:
+      - record_id
+      - text
+      type: object
     visible: true
-    description: "Remove all lines from the scratchpad."
-    permissions: "auto"
-    _provider: "app"
-    handler: "scratchpad_wipe.wipe_records"
+  scratchpad_wipe_records:
+    description: Remove all lines from the scratchpad.
+    handler: scratchpad_wipe.wipe_records
+    require_approval: false
     schema:
-      type: "object"
       properties: {}
-      required: []
+      type: object
+    visible: true
+  file_list:
+    description: Show list of files in user's directory from newest to oldest. Returns total count of files and range shown.
+    handler: file_list.list_files
+    require_approval: false
+    schema:
+      properties:
+        start_id:
+          type: integer
+          description: Index to start listing files from (0-indexed).
+        count:
+          type: integer
+          description: Max number of files to return (maximum 20).
+      type: object
+    visible: true
+  file_read_lines:
+    description: Return lines from a requested text file in the user's directory. Returns total lines, range shown, lines content, and end of file mark if reached.
+    handler: file_read_lines.read_file_lines
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: The exact name of the file to read (must not contain path separators or traversal marks).
+        start_id:
+          type: integer
+          description: The 1-based line number to start reading from.
+        count:
+          type: integer
+          description: Max number of lines to return (maximum 50).
+      required:
+      - file_name
+      type: object
+    visible: true
+  file_search:
+    description: Search for a query string in a file from the user's directory. Returns line numbers and snippets around match (max 50 results).
+    handler: file_search.search_file
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: The exact name of the file to search in (must not contain path separators or traversal marks).
+        query:
+          type: string
+          description: The query sequence to search for.
+      required:
+      - file_name
+      - query
+      type: object
+    visible: true
 """
+
 
 def print_status(msg, status="INFO"):
     colors = {

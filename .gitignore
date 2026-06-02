@@ -1,7 +1,6 @@
 /.env
 /.pytest_cache
 /.venv
-/PROJECT_CONCEPT.md
 /logs
 /tests
 /data/cache/*
@@ -10,4 +9,5 @@
 /data/images/*
 /data/audio/*
 /data/mcp/*
+/data/documents/*
 **/__pycache__/*

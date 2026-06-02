@@ -20,6 +20,9 @@ from imports.tools.scratchpad_add import add_record as sp_add
 from imports.tools.scratchpad_remove import remove_record as sp_remove
 from imports.tools.scratchpad_update import update_record as sp_update
 from imports.tools.scratchpad_wipe import wipe_records as sp_wipe
+from imports.tools.file_list import list_files as fl_list
+from imports.tools.file_read_lines import read_file_lines as fl_read
+from imports.tools.file_search import search_file as fl_search
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +830,9 @@ class Orchestrator:
                 'scratchpad_remove.remove_record': lambda: sp_remove(self.conv_store, user_id, tool_args),
                 'scratchpad_update.update_record': lambda: sp_update(self.conv_store, user_id, tool_args),
                 'scratchpad_wipe.wipe_records': lambda: sp_wipe(self.conv_store, user_id, tool_args),
+                'file_list.list_files': lambda: fl_list(user_id, tool_args),
+                'file_read_lines.read_file_lines': lambda: fl_read(user_id, tool_args),
+                'file_search.search_file': lambda: fl_search(user_id, tool_args),
             }
             fn = dispatch.get(handler)
             # Fallback for older configs without the full module.function name
