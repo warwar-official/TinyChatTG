@@ -36,6 +36,7 @@ from imports.config import CONFIG, get_provider, get_bot_config, get_telegram_to
 from imports.providers.lm_studio import LMStudioProvider
 from imports.providers.gemini import GeminiProvider
 from imports.memory.store import MemoryStore
+from imports.files.store import FileStore
 from imports.mcp.manager import MCPManager
 from imports.orchestrator import Orchestrator
 from imports.utils.logger import get_user_logger, init_logging
@@ -310,12 +311,33 @@ async def _tool_status(chat_id: int, text: str):
             pass
 
 
+# Send file callback: sends a file to the user
+async def _send_file_callback(chat_id: int, file_path: str, real_name: str):
+    from aiogram.types import FSInputFile
+    try:
+        f = FSInputFile(file_path, filename=real_name)
+        await bot.send_document(chat_id, f)
+    except Exception as e:
+        logger.error("Failed to send file %s to chat %d: %s", file_path, chat_id, e)
+        raise
+
+# Initialize FileStore sharing embed_fn and Qdrant client with MemoryStore
+file_store = FileStore(
+    project_root=PROJECT_ROOT,
+    embed_fn=mem_store.embed_fn,
+    embed_dim=mem_store.embed_dimension,
+    qdrant_client=mem_store.qdrant
+)
+
+
 orchestrator = Orchestrator(
     CONFIG, lm, mem_store,
     mcp_mgr=mcp_mgr,
     approval_callback=_approval_ui,
     status_callback=_tool_status,
     conv_store=conv_store,
+    file_store=file_store,
+    send_file_callback=_send_file_callback,
 )
 
 # STT (Whisper) client — reads GROQ_API_KEY from env
@@ -626,28 +648,50 @@ async def handle_all(message: types.Message):
     # Save images if present
     imgs = []
     if message.photo:
-        # Support media groups (albums) by grouping files under media_group_id
-        mg = getattr(message, 'media_group_id', None)
-        if mg:
-            folder = PROJECT_ROOT / 'data' / 'images' / str(user_id) / str(mg)
-        else:
-            folder = PROJECT_ROOT / 'data' / 'images' / str(user_id)
-        folder.mkdir(parents=True, exist_ok=True)
         # save highest resolution photo in this message
         photo = message.photo[-1]
-        file_path = folder / f"{photo.file_unique_id}.jpg"
         try:
-            await bot.download(photo, destination=str(file_path))
-            imgs.append(str(file_path))
+            # download to memory/temp
+            import io
+            bio = io.BytesIO()
+            await bot.download(photo, destination=bio)
+            bio.seek(0)
+            
+            # Temporary save to compress
+            temp_path = PROJECT_ROOT / "data" / "tmp"
+            temp_path.mkdir(parents=True, exist_ok=True)
+            tmp_file = temp_path / f"{photo.file_unique_id}.jpg"
+            with open(tmp_file, "wb") as f:
+                f.write(bio.read())
+            
+            compress_image_to_2mp(str(tmp_file))
+            
+            with open(tmp_file, "rb") as f:
+                compressed_bytes = f.read()
+            
+            # Remove temp file
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
+
+            res = file_store.register_image(user_id, compressed_bytes, "image.jpg")
+            imgs.append(res["path"])
+            
+            if res.get("is_new"):
+                # Queue description task
+                asyncio.create_task(
+                    orchestrator.queue_image_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                )
         except Exception as e:
-            get_user_logger(user_id).warning("Failed to download photo: %s", e)
+            get_user_logger(user_id).warning("Failed to process photo: %s", e)
 
     # Process documents
     file_context = ""
     if message.document:
         doc = message.document
-        if doc.file_size > 2 * 1024 * 1024:
-            await message.reply("File is too big")
+        if doc.file_size > 20 * 1024 * 1024:
+            await message.reply("File is too big (max 20 MB)")
             return
 
         orig_name = doc.file_name or "file"
@@ -657,48 +701,232 @@ async def handle_all(message: types.Message):
 
         image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
         text_extensions = {
-            '.txt', '.md', '.html', '.htm', '.py', '.js', '.css', '.json', '.xml', 
-            '.csv', '.yaml', '.yml', '.ini', '.conf', '.log', '.sh', '.bat', '.ts', 
-            '.tsx', '.jsx', '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.php', 
-            '.sql', '.rb', '.pl', '.pm'
+            '.txt', '.md', '.html', '.htm', '.py', '.js', '.css', '.json', '.xml',
+            '.csv', '.yaml', '.yml', '.ini', '.conf', '.log', '.sh', '.bat', '.ts',
+            '.tsx', '.jsx', '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.php',
+            '.sql', '.rb', '.pl', '.pm',
         }
+        from imports.files.converter import PANDOC_INPUT_EXTENSIONS
+        pandoc_extensions = PANDOC_INPUT_EXTENSIONS
+        pdf_extensions = {'.pdf'}
 
         is_image = mime_type.startswith('image/') or file_ext in image_extensions
-        is_text = mime_type.startswith('text/') or file_ext in text_extensions or mime_type in {'application/json', 'application/xml', 'application/javascript', 'application/x-javascript'}
+        is_text = (
+            mime_type.startswith('text/')
+            or file_ext in text_extensions
+            or mime_type in {'application/json', 'application/xml', 'application/javascript', 'application/x-javascript'}
+        )
+        is_pandoc = file_ext in pandoc_extensions
+        is_pdf = file_ext in pdf_extensions or mime_type == 'application/pdf'
 
         if is_image:
-            folder = PROJECT_ROOT / 'data' / 'images' / str(user_id)
-            folder.mkdir(parents=True, exist_ok=True)
-            file_path = folder / f"{doc.file_unique_id}{file_ext}"
             try:
-                await bot.download(doc, destination=str(file_path))
-                compress_image_to_2mp(str(file_path))
-                imgs.append(str(file_path))
+                import io
+                bio = io.BytesIO()
+                await bot.download(doc, destination=bio)
+                bio.seek(0)
+
+                temp_path = PROJECT_ROOT / "data" / "tmp"
+                temp_path.mkdir(parents=True, exist_ok=True)
+                tmp_file = temp_path / f"{doc.file_unique_id}{file_ext}"
+                with open(tmp_file, "wb") as f:
+                    f.write(bio.read())
+
+                compress_image_to_2mp(str(tmp_file))
+
+                with open(tmp_file, "rb") as f:
+                    compressed_bytes = f.read()
+
+                try:
+                    tmp_file.unlink()
+                except Exception:
+                    pass
+
+                res = file_store.register_image(user_id, compressed_bytes, clean_name)
+                imgs.append(res["path"])
+
+                if res.get("is_new"):
+                    asyncio.create_task(
+                        orchestrator.queue_image_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                    )
             except Exception as e:
-                get_user_logger(user_id).warning("Failed to download image file: %s", e)
-                await message.reply("Failed to download image.")
+                get_user_logger(user_id).warning("Failed to process image document: %s", e)
+                await message.reply("Failed to process image.")
                 return
+
         elif is_text:
-            folder = PROJECT_ROOT / 'data' / 'documents' / str(user_id)
-            folder.mkdir(parents=True, exist_ok=True)
-            file_path = folder / clean_name
             try:
-                await bot.download(doc, destination=str(file_path))
-                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                import io
+                bio = io.BytesIO()
+                await bot.download(doc, destination=bio)
+                doc_bytes = bio.getvalue()
+
+                res = file_store.register_document(user_id, doc_bytes, clean_name)
+
+                with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
                     content_str = f.read()
-                
+
                 num_chars = len(content_str)
                 if num_chars <= 15000:
                     file_context = f"[File from user: {clean_name}]\n{content_str}"
                 else:
                     file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
+
+                if res.get("is_new"):
+                    asyncio.create_task(
+                        orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                    )
             except Exception as e:
                 get_user_logger(user_id).warning("Failed to process text file: %s", e)
                 await message.reply("Failed to process text file.")
                 return
+
+        elif is_pandoc:
+            # ── Office document via Pandoc ──────────────────────────────────
+            try:
+                import io
+                from imports.files.converter import convert_office_to_markdown
+
+                bio = io.BytesIO()
+                await bot.download(doc, destination=bio)
+                raw_bytes = bio.getvalue()
+
+                import hashlib
+                raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+                res = file_store.check_converted_document_exists(user_id, raw_hash)
+                if not res:
+                    temp_path = PROJECT_ROOT / "data" / "tmp"
+                    temp_path.mkdir(parents=True, exist_ok=True)
+                    tmp_src = temp_path / f"{doc.file_unique_id}{file_ext}"
+                    tmp_src.write_bytes(raw_bytes)
+
+                    # Determine media directory (named by hash of raw bytes)
+                    media_dir = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"
+
+                    try:
+                        md_text = await convert_office_to_markdown(tmp_src, media_dir)
+                    finally:
+                        try:
+                            tmp_src.unlink()
+                        except Exception:
+                            pass
+
+                    md_bytes = md_text.encode("utf-8")
+                    res = file_store.register_converted_document(
+                        user_id, md_bytes, clean_name, raw_hash=raw_hash, media_dir=str(media_dir)
+                    )
+                else:
+                    with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
+                        md_text = f.read()
+
+                if len(md_text) <= 15000:
+                    file_context = f"[File from user: {clean_name}]\n{md_text}"
+                else:
+                    file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
+
+                if res.get("is_new"):
+                    asyncio.create_task(
+                        orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                    )
+            except Exception as e:
+                get_user_logger(user_id).warning("Failed to process office document: %s", e)
+                await message.reply(f"Failed to convert document: {e}")
+                return
+
+        elif is_pdf:
+            # ── PDF via PyMuPDF + Gemini OCR ────────────────────────────────
+            try:
+                import io
+                from imports.files.converter import convert_pdf_to_markdown
+
+                import hashlib
+                raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+                
+                res = file_store.check_converted_document_exists(user_id, raw_hash)
+                
+                # If we don't have it, perform OCR
+                if not res:
+                    # Notify user that processing is starting
+                    proc_msg = await bot.send_message(message.chat.id, "📄 File processing. Please wait...")
+
+                    # Switch chat action to "upload_document" during OCR
+                    async def _keep_upload_action(cid: int, interval: float = 4.0):
+                        try:
+                            while True:
+                                try:
+                                    await bot.send_chat_action(cid, "upload_document")
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(interval)
+                        except asyncio.CancelledError:
+                            return
+
+                    upload_action_task = asyncio.create_task(_keep_upload_action(message.chat.id))
+
+                    try:
+                        temp_path = PROJECT_ROOT / "data" / "tmp"
+                        temp_path.mkdir(parents=True, exist_ok=True)
+                        tmp_src = temp_path / f"{doc.file_unique_id}.pdf"
+                        tmp_src.write_bytes(raw_bytes)
+
+                        # Determine media directory (named by hash of raw bytes)
+                        media_dir = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"
+                        try:
+                            md_text = await convert_pdf_to_markdown(
+                                tmp_src,
+                                gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
+                                media_dir=media_dir,
+                            )
+                        finally:
+                            try:
+                                tmp_src.unlink()
+                            except Exception:
+                                pass
+                    finally:
+                        upload_action_task.cancel()
+                        try:
+                            await upload_action_task
+                        except Exception:
+                            pass
+
+                    # Delete the "processing" message
+                    try:
+                        await bot.delete_message(message.chat.id, proc_msg.message_id)
+                    except Exception:
+                        pass
+
+                    md_bytes = md_text.encode("utf-8")
+                    res = file_store.register_converted_document(
+                        user_id, md_bytes, clean_name, raw_hash=raw_hash, media_dir=str(media_dir)
+                    )
+                else:
+                    with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
+                        md_text = f.read()
+
+                if len(md_text) <= 15000:
+                    file_context = f"[File from user: {clean_name}]\n{md_text}"
+                else:
+                    file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
+
+                if res.get("is_new"):
+                    asyncio.create_task(
+                        orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                    )
+            except Exception as e:
+                get_user_logger(user_id).warning("Failed to process PDF: %s", e)
+                # Clean up the processing message if still around
+                try:
+                    await bot.delete_message(message.chat.id, proc_msg.message_id)
+                except Exception:
+                    pass
+                await message.reply(f"Failed to process PDF: {e}")
+                return
+
         else:
-            await message.reply("File type does not suported")
+            await message.reply("File type not supported")
             return
+
 
     # Save voice message if present
     voice_path = None
@@ -736,7 +964,9 @@ async def handle_all(message: types.Message):
     if forwarded_note:
         parts.append(forwarded_note.strip())
     if imgs:
-        parts.append("[image attached]")
+        # Include original file names of images if known, else a generic note
+        image_names = [Path(p).name for p in imgs]
+        parts.append(f"[image: {', '.join(image_names)}]")
     if file_context:
         parts.append(file_context)
     if raw_text:

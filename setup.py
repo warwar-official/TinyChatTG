@@ -47,55 +47,6 @@ DEFAULT_TOOLS_YAML = """tools:
       - query
       type: object
     visible: true
-  scratchpad_add_record:
-    description: Append a new line to your private scratchpad. The scratchpad is always visible in your system context.
-    handler: scratchpad_add.add_record
-    require_approval: false
-    schema:
-      properties:
-        text:
-          type: string
-          description: Text of the new scratchpad line.
-      required:
-      - text
-      type: object
-    visible: true
-  scratchpad_remove_record:
-    description: Remove a line from the scratchpad by its line number (1-based).
-    handler: scratchpad_remove.remove_record
-    require_approval: false
-    schema:
-      properties:
-        record_id:
-          type: integer
-          description: Line number to remove (1-based).
-      required:
-      - record_id
-      type: object
-    visible: true
-  scratchpad_update_record:
-    description: Replace the text of an existing scratchpad line.
-    handler: scratchpad_update.update_record
-    require_approval: false
-    schema:
-      properties:
-        record_id:
-          type: integer
-          description: Line number to update (1-based).
-        text:
-          type: string
-          description: New text for the line.
-      required:
-      - record_id
-      - text
-      type: object
-    visible: true
-  scratchpad_wipe_records:
-    description: Remove all lines from the scratchpad.
-    handler: scratchpad_wipe.wipe_records
-    require_approval: false
-    schema:
-      properties: {}
       type: object
     visible: true
   file_list:

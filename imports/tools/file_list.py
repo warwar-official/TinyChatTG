@@ -1,13 +1,13 @@
 import datetime
-from pathlib import Path
 from typing import Dict, Any
 
+from imports.files.store import FileStore
 
-def list_files(user_id: int, args: Dict[str, Any]) -> str:
+
+def list_files(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     start_id = args.get('start_id', 0)
     count = args.get('count', 20)
 
-    # Convert/validate inputs
     try:
         start_id = int(start_id) if start_id is not None else 0
     except (TypeError, ValueError):
@@ -24,34 +24,41 @@ def list_files(user_id: int, args: Dict[str, Any]) -> str:
     if start_id < 0:
         start_id = 0
 
-    project_root = Path(__file__).resolve().parents[2]
-    user_dir = project_root / 'data' / 'documents' / str(user_id)
-
-    if not user_dir.exists() or not user_dir.is_dir():
-        return "Total files: 0\nRange shown: N/A\n\nNo files found."
-
-    files = [f for f in user_dir.iterdir() if f.is_file()]
-    # Sort from new to old (mtime descending)
-    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    total_files = len(files)
+    # Get total count (full list) then slice
+    all_files = file_store.list_files(user_id, start=0, count=10000)
+    total_files = len(all_files)
 
     if total_files == 0:
-        return "Total files: 0\nRange shown: N/A\n\nNo files found."
+        return {
+            "status": "success",
+            "total_files": 0,
+            "start_id": start_id,
+            "end_id": None,
+            "files": []
+        }
 
     end_id = min(start_id + count, total_files)
-    slice_files = files[start_id:end_id]
+    slice_files = all_files[start_id:end_id]
 
-    lines = []
-    lines.append(f"Total files: {total_files}")
-    if start_id < total_files:
-        lines.append(f"Range shown: {start_id} to {end_id - 1} (0-indexed)")
-    else:
-        lines.append("Range shown: N/A (start_id out of bounds)")
-    lines.append("")
+    files_list = []
+    for i, rec in enumerate(slice_files, start=start_id):
+        origin = rec.get("origin", "?")
+        ftype = rec.get("type", "?")
+        ts = rec.get("timestamp", 0)
+        mtime = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else "unknown"
+        real_name = rec.get("real_name", "?")
+        files_list.append({
+            "id": i,
+            "real_name": real_name,
+            "type": ftype,
+            "origin": origin,
+            "modified": mtime
+        })
 
-    for i, f in enumerate(slice_files, start=start_id):
-        sz = f.stat().st_size
-        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-        lines.append(f"[{i}] {f.name} - {sz} bytes - Modified: {mtime}")
-
-    return "\n".join(lines)
+    return {
+        "status": "success",
+        "total_files": total_files,
+        "start_id": start_id,
+        "end_id": end_id - 1 if start_id < total_files else None,
+        "files": files_list
+    }

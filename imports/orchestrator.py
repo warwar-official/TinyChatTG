@@ -16,13 +16,15 @@ from imports.providers.lm_studio import LMStudioProvider
 
 from imports.tools.remember_info import add_memory as mm_add
 from imports.tools.recall_info import search_memory as ms_search
-from imports.tools.scratchpad_add import add_record as sp_add
-from imports.tools.scratchpad_remove import remove_record as sp_remove
-from imports.tools.scratchpad_update import update_record as sp_update
-from imports.tools.scratchpad_wipe import wipe_records as sp_wipe
 from imports.tools.file_list import list_files as fl_list
 from imports.tools.file_read_lines import read_file_lines as fl_read
-from imports.tools.file_search import search_file as fl_search
+from imports.tools.file_grep import grep_file as fl_grep
+from imports.tools.file_find_by_name import find_by_name as fl_find_name
+from imports.tools.file_find_by_similarity import find_by_similarity as fl_find_sim
+from imports.tools.file_create import create_file as fl_create
+from imports.tools.file_add_lines import add_lines as fl_add_lines
+from imports.tools.file_replace_lines import replace_lines as fl_replace_lines
+from imports.tools.file_send import send_file as fl_send
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,9 @@ class Orchestrator:
     def __init__(self, config: Dict[str, Any], provider, mem_store, mcp_mgr=None,
                  approval_callback: Optional[Callable] = None,
                  status_callback: Optional[Callable] = None,
-                 conv_store=None):
+                 conv_store=None,
+                 file_store=None,
+                 send_file_callback: Optional[Callable] = None):
         self.config = config
         self.provider = provider
         self.mem_store = mem_store
@@ -61,6 +65,8 @@ class Orchestrator:
         self.approval_callback = approval_callback
         self.status_callback = status_callback
         self.conv_store = conv_store
+        self.file_store = file_store
+        self.send_file_callback = send_file_callback
 
         self.primary_queue: asyncio.Queue = asyncio.Queue()
 
@@ -102,9 +108,10 @@ class Orchestrator:
             pass
 
         bot_conf = (self.config or {}).get('bot', {})
-        self.max_messages = bot_conf.get('max_messages', 15)
         self.last_messages_tail = bot_conf.get('last_messages_tail', 5)
+        self.max_messages = bot_conf.get('max_messages', 15)
         self.max_tool_iterations = bot_conf.get('max_tool_iterations', 5)
+        self.summarize_tool_results = bot_conf.get('summarize_tool_results', True)
 
         # Load prompts
         self.personality_prompt = PROMPTS.get('personality_prompt', 'You are a helpful AI assistant.')
@@ -175,6 +182,7 @@ class Orchestrator:
             logger.warning("Failed to load orchestrator state: %s", e)
 
     async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
+        self._stopped_users.discard(user_id)
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         # Persist a JSON-serializable record of the pending job (without future)
@@ -278,6 +286,7 @@ class Orchestrator:
     async def stop_user(self, user_id: int) -> None:
         """Cancel any in-flight generation and pending approval for this user."""
         self._user_interrupt[user_id] = {"type": "stop"}
+        self._stopped_users.add(user_id)
         # Decline pending approval
         approval_id = self._user_pending_approval.get(user_id)
         if approval_id:
@@ -288,8 +297,6 @@ class Orchestrator:
         task = self._user_job_tasks.get(user_id)
         if task and not task.done():
             task.cancel()
-        # Mark so subsequent queued jobs are also skipped
-        self._stopped_users.add(user_id)
 
     async def _acquire_rate_slot(self):
         """Simple requests-per-minute limiter for model calls."""
@@ -429,25 +436,13 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Failed to search memories for user %d: %s", user_id, e)
 
-        scratchpad_section = ""
-        try:
-            sp_lines = self.conv_store.get_scratchpad(user_id)
-            if sp_lines:
-                numbered = '\n'.join(f"{i + 1}: {line}" for i, line in enumerate(sp_lines))
-                scratchpad_section = f"[Scratchpad]\n{numbered}\n"
-            else:
-                scratchpad_section = "[Scratchpad]\n[]\n"
-        except Exception as e:
-            logger.warning("Failed to get scratchpad for user %d: %s", user_id, e)
-
         # Build final system content using the template
         sys_content = self.context_template.format(
             personality=self.personality_prompt,
             tool_using_explanation=self.tool_using_explanation_prompt,
             runtime_time=now_str,
             summary_section=summary_section,
-            memories_section=memories_section,
-            scratchpad_section=scratchpad_section
+            memories_section=memories_section
         ).strip()
 
         messages.append({"role": "system", "content": sys_content})
@@ -472,7 +467,17 @@ class Orchestrator:
                     call_id = meta.get('tool_call_id', 'call_0') if isinstance(meta, dict) else 'call_0'
                     is_summarized = meta.get('summarized', False) if isinstance(meta, dict) else False
                     prefix = "[summarized tool result] " if is_summarized else ""
-                    messages.append({"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": f"{prefix}{text}"})
+                    
+                    inline_images = meta.get('inline_images') if isinstance(meta, dict) else None
+                    if inline_images:
+                        content_arr = [{"type": "text", "text": f"{prefix}{text}"}]
+                        # Append images as-is (they already have type: image_url and data URI)
+                        for img in inline_images:
+                            if isinstance(img, dict) and "image_url" in img:
+                                content_arr.append(img)
+                        messages.append({"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": content_arr})
+                    else:
+                        messages.append({"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": f"{prefix}{text}"})
                 elif role == 'assistant':
                     # Check if this is a function_call record
                     if isinstance(meta, dict) and meta.get('function_call'):
@@ -779,11 +784,23 @@ class Orchestrator:
                             continue
 
                 # Execute tool
-                result = await self._execute_tool(tool_name, tool_args, tool_conf, user_id, ulog)
+                result = await self._execute_tool(tool_name, tool_args, tool_conf, user_id, ulog, chat_id=chat_id)
+
+                # Extract inline images from result to keep text_result small
+                inline_images = None
+                if isinstance(result, dict) and "images" in result:
+                    inline_images = result.pop("images")
 
                 # Convert result to text
-                if isinstance(result, dict):
-                    text_result = str(result.get('result') or result.get('entry') or result.get('text') or result)
+                if isinstance(result, (dict, list)):
+                    if tool_name.startswith('file_'):
+                        text_result = json.dumps(result, ensure_ascii=False)
+                    else:
+                        extracted = result.get('result') or result.get('entry') or result.get('text') if isinstance(result, dict) else None
+                        if extracted is not None:
+                            text_result = str(extracted)
+                        else:
+                            text_result = json.dumps(result, ensure_ascii=False)
                 else:
                     text_result = str(result)
 
@@ -794,12 +811,15 @@ class Orchestrator:
 
                 # Append tool result to conversation history
                 try:
-                    self.conv_store.append_message(user_id, 'tool', text_result, meta={'tool': tool_name, 'tool_call_id': call_id})
+                    meta = {'tool': tool_name, 'tool_call_id': call_id}
+                    if inline_images:
+                        meta['inline_images'] = inline_images
+                    self.conv_store.append_message(user_id, 'tool', text_result, meta=meta)
                 except Exception as e:
                     ulog.error("Failed to append tool result: %s", e)
 
                 # If tool result is long, schedule summarization on secondary queue
-                if len(text_result) > 3000:
+                if self.summarize_tool_results and len(text_result) > 3000:
                     await self.primary_queue.put({
                         "coro": self._summarize_tool_result(user_id, tool_name, text_result)
                     })
@@ -818,21 +838,24 @@ class Orchestrator:
         # If we exhausted iterations, return an error
         return {"error": "Too many tool call iterations, stopping."}
 
-    async def _execute_tool(self, tool_name: str, tool_args: Dict, tool_conf: Dict, user_id: int, ulog: logging.Logger) -> Any:
+    async def _execute_tool(self, tool_name: str, tool_args: Dict, tool_conf: Dict, user_id: int, ulog: logging.Logger, chat_id: int = 0) -> Any:
         """Execute a tool call — local handler or MCP."""
         provider = tool_conf.get('_provider')
         if provider == 'app':
             handler = tool_conf.get('handler')
+            fs = self.file_store
             dispatch = {
                 'remember_info.add_memory': lambda: mm_add(self.mem_store, user_id, tool_args),
                 'recall_info.search_memory': lambda: ms_search(self.mem_store, user_id, tool_args),
-                'scratchpad_add.add_record': lambda: sp_add(self.conv_store, user_id, tool_args),
-                'scratchpad_remove.remove_record': lambda: sp_remove(self.conv_store, user_id, tool_args),
-                'scratchpad_update.update_record': lambda: sp_update(self.conv_store, user_id, tool_args),
-                'scratchpad_wipe.wipe_records': lambda: sp_wipe(self.conv_store, user_id, tool_args),
-                'file_list.list_files': lambda: fl_list(user_id, tool_args),
-                'file_read_lines.read_file_lines': lambda: fl_read(user_id, tool_args),
-                'file_search.search_file': lambda: fl_search(user_id, tool_args),
+                'file_list.list_files': lambda: fl_list(fs, user_id, tool_args),
+                'file_read_lines.read_file_lines': lambda: fl_read(fs, user_id, tool_args),
+                'file_grep.grep_file': lambda: fl_grep(fs, user_id, tool_args),
+                'file_find_by_name.find_by_name': lambda: fl_find_name(fs, user_id, tool_args),
+                'file_find_by_similarity.find_by_similarity': lambda: fl_find_sim(fs, user_id, tool_args),
+                'file_create.create_file': lambda: fl_create(fs, user_id, tool_args),
+                'file_add_lines.add_lines': lambda: fl_add_lines(fs, user_id, tool_args),
+                'file_replace_lines.replace_lines': lambda: fl_replace_lines(fs, user_id, tool_args),
+                'file_send.send_file': lambda: fl_send(fs, user_id, tool_args),
             }
             fn = dispatch.get(handler)
             # Fallback for older configs without the full module.function name
@@ -841,10 +864,23 @@ class Orchestrator:
                     fn = lambda: mm_add(self.mem_store, user_id, tool_args)
                 elif 'memory_search' in handler or 'recall_info' in handler:
                     fn = lambda: ms_search(self.mem_store, user_id, tool_args)
-                    
+
             if fn:
                 try:
-                    return fn()
+                    raw = fn()
+                    # Handle file_send sentinel
+                    if isinstance(raw, dict) and '_send_file' in raw:
+                        file_path = raw['_send_file']
+                        file_real_name = raw.get('real_name', 'file')
+                        if self.send_file_callback:
+                            try:
+                                await self.send_file_callback(chat_id, file_path, file_real_name)
+                                return {"status": "success", "message": f"File '{file_real_name}' sent to user successfully."}
+                            except Exception as e:
+                                ulog.error("send_file_callback failed: %s", e)
+                                return {"status": "error", "message": f"Error sending file: {e}"}
+                        return {"status": "error", "message": f"File '{file_real_name}' ready but no send callback is configured."}
+                    return raw
                 except Exception as e:
                     ulog.error("Local tool '%s' failed: %s", tool_name, e)
                     return {"error": str(e)}
@@ -1097,3 +1133,196 @@ class Orchestrator:
             return str(resp)
         except Exception:
             return str(resp)
+
+    # ─── File Description Queue ─────────────────────────────────────────
+
+    async def queue_image_describe(self, user_id: int, hash_name: str, real_name: str, user_text: str = ""):
+        """Enqueue a background image description job."""
+        try:
+            coro = self._describe_image(user_id, hash_name, real_name, user_text)
+            await self.primary_queue.put({"coro": coro})
+        except Exception as e:
+            logger.warning("Failed to queue image describe: %s", e)
+
+    async def queue_document_describe(self, user_id: int, hash_name: str, real_name: str, user_text: str = ""):
+        """Enqueue a background document description job."""
+        try:
+            coro = self._describe_document(user_id, hash_name, real_name, user_text)
+            await self.primary_queue.put({"coro": coro})
+        except Exception as e:
+            logger.warning("Failed to queue document describe: %s", e)
+
+    async def _describe_image(self, user_id: int, hash_name: str, real_name: str, user_text: str):
+        """Background coro: send image to model and store resulting description."""
+        ulog = get_user_logger(user_id)
+        ulog.debug("describe_image: job starting. hash_name=%s, real_name=%s, user_text=%r", hash_name, real_name, user_text)
+        logger.debug("[user_%d] describe_image: job starting. hash_name=%s, real_name=%s, user_text=%r", user_id, hash_name, real_name, user_text)
+        if not self.file_store:
+            ulog.warning("describe_image: file_store is not initialized")
+            logger.warning("[user_%d] describe_image: file_store is not initialized", user_id)
+            return
+        try:
+            import base64
+            import mimetypes
+            from pathlib import Path
+            imgs_dir = Path(__file__).resolve().parents[1] / 'data' / 'files' / 'images'
+            phys = imgs_dir / hash_name
+            if not phys.exists():
+                ulog.warning("describe_image: physical file not found for %s", hash_name)
+                logger.warning("[user_%d] describe_image: physical file not found for %s", user_id, hash_name)
+                return
+
+            with open(phys, 'rb') as fh:
+                b64 = base64.b64encode(fh.read()).decode('utf-8')
+            mime, _ = mimetypes.guess_type(str(phys))
+            mime = mime or 'image/jpeg'
+            ulog.debug("describe_image: loaded file size: %d bytes, mime: %s", len(b64), mime)
+            logger.debug("[user_%d] describe_image: loaded file size: %d bytes, mime: %s", user_id, len(b64), mime)
+
+            describe_prompt = PROMPTS.get(
+                'image_describe_prompt',
+                'Write a short, search-friendly description of this image for metadata indexing. '
+                'Focus on visible content, subjects, and context. Return only the description, nothing else.'
+            )
+            ulog.debug("describe_image: prompt used: %r", describe_prompt)
+            logger.debug("[user_%d] describe_image: prompt used: %r", user_id, describe_prompt)
+
+            user_content = []
+            if user_text:
+                user_content.append({"type": "text", "text": f"[Users message] {user_text}"})
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"}
+            })
+
+            msgs = [
+                {"role": "system", "content": describe_prompt},
+                {"role": "user", "content": user_content},
+            ]
+
+            # Construct clean log representation to avoid base64 bloat
+            log_msgs = []
+            for m in msgs:
+                if m["role"] == "user":
+                    cleaned_content = []
+                    for item in m["content"]:
+                        if item.get("type") == "image_url":
+                            cleaned_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,<TRUNCATED>"}})
+                        else:
+                            cleaned_content.append(item)
+                    log_msgs.append({"role": m["role"], "content": cleaned_content})
+                else:
+                    log_msgs.append(m)
+
+            ulog.debug("describe_image: calling model with messages: %r", log_msgs)
+            logger.debug("[user_%d] describe_image: calling model with messages: %r", user_id, log_msgs)
+
+            resp = await self._chat_with_fallback(msgs, user_id=user_id)
+            ulog.debug("describe_image: raw model response: %r", resp)
+            logger.debug("[user_%d] describe_image: raw model response: %r", user_id, resp)
+
+            if isinstance(resp, dict) and resp.get('error'):
+                ulog.error("describe_image: model error for %s: %s", hash_name, resp.get('error'))
+                logger.error("[user_%d] describe_image: model error for %s: %s", user_id, hash_name, resp.get('error'))
+                return
+
+            raw_text = self._extract_text_from_response(resp)
+            ulog.debug("describe_image: extracted raw text before thinking stripped: %r", raw_text)
+            logger.debug("[user_%d] describe_image: extracted raw text before thinking stripped: %r", user_id, raw_text)
+
+            description = _strip_thinking(raw_text).strip()
+            ulog.debug("describe_image: final description: %r", description)
+            logger.debug("[user_%d] describe_image: final description: %r", user_id, description)
+
+            if not description:
+                ulog.warning("describe_image: empty description for %s", hash_name)
+                logger.warning("[user_%d] describe_image: empty description for %s", user_id, hash_name)
+                return
+
+            self.file_store.update_description(user_id, hash_name, description)
+            ulog.info("describe_image: stored description for %s (%d chars)", hash_name, len(description))
+            logger.info("[user_%d] describe_image: stored description for %s (%d chars)", user_id, hash_name, len(description))
+        except Exception as e:
+            ulog.error("describe_image failed for %s: %s", hash_name, e)
+            logger.exception("[user_%d] describe_image failed for %s: %s", user_id, hash_name, e)
+
+    async def _describe_document(self, user_id: int, hash_name: str, real_name: str, user_text: str):
+        """Background coro: send document excerpt to model and store resulting description."""
+        ulog = get_user_logger(user_id)
+        ulog.debug("describe_document: job starting. hash_name=%s, real_name=%s, user_text=%r", hash_name, real_name, user_text)
+        logger.debug("[user_%d] describe_document: job starting. hash_name=%s, real_name=%s, user_text=%r", user_id, hash_name, real_name, user_text)
+        if not self.file_store:
+            ulog.warning("describe_document: file_store is not initialized")
+            logger.warning("[user_%d] describe_document: file_store is not initialized", user_id)
+            return
+        try:
+            from pathlib import Path
+            docs_dir = Path(__file__).resolve().parents[1] / 'data' / 'files' / 'documents'
+            phys = docs_dir / hash_name
+            if not phys.exists():
+                ulog.warning("describe_document: physical file not found for %s", hash_name)
+                logger.warning("[user_%d] describe_document: physical file not found for %s", user_id, hash_name)
+                return
+
+            with open(phys, 'r', encoding='utf-8', errors='replace') as fh:
+                lines = fh.readlines()
+
+            # First 100 lines, max 10 000 chars
+            content = ""
+            for line in lines[:100]:
+                content += line
+                if len(content) >= 10000:
+                    content = content[:10000]
+                    break
+
+            ulog.debug("describe_document: read %d lines, extracted %d characters for excerpt", len(lines), len(content))
+            logger.debug("[user_%d] describe_document: read %d lines, extracted %d characters for excerpt", user_id, len(lines), len(content))
+
+            describe_prompt = PROMPTS.get(
+                'document_describe_prompt',
+                'Write a short, search-friendly description of this document for metadata indexing. '
+                'Focus on the topic, key concepts, and main content. Return only the description, nothing else.'
+            )
+            ulog.debug("describe_document: prompt used: %r", describe_prompt)
+            logger.debug("[user_%d] describe_document: prompt used: %r", user_id, describe_prompt)
+
+            user_msg = ""
+            if user_text:
+                user_msg += f"[Users message] {user_text}\n"
+            user_msg += f"[File part]\n{content}"
+
+            msgs = [
+                {"role": "system", "content": describe_prompt},
+                {"role": "user", "content": user_msg},
+            ]
+            ulog.debug("describe_document: calling model with messages: %r", msgs)
+            logger.debug("[user_%d] describe_document: calling model with messages: %r", user_id, msgs)
+
+            resp = await self._chat_with_fallback(msgs, user_id=user_id)
+            ulog.debug("describe_document: raw model response: %r", resp)
+            logger.debug("[user_%d] describe_document: raw model response: %r", user_id, resp)
+
+            if isinstance(resp, dict) and resp.get('error'):
+                ulog.error("describe_document: model error for %s: %s", hash_name, resp.get('error'))
+                logger.error("[user_%d] describe_document: model error for %s: %s", user_id, hash_name, resp.get('error'))
+                return
+
+            raw_text = self._extract_text_from_response(resp)
+            ulog.debug("describe_document: extracted raw text before thinking stripped: %r", raw_text)
+            logger.debug("[user_%d] describe_document: extracted raw text before thinking stripped: %r", user_id, raw_text)
+
+            description = _strip_thinking(raw_text).strip()
+            ulog.debug("describe_document: final description: %r", description)
+            logger.debug("[user_%d] describe_document: final description: %r", user_id, description)
+
+            if not description:
+                ulog.warning("describe_document: empty description for %s", hash_name)
+                logger.warning("[user_%d] describe_document: empty description for %s", user_id, hash_name)
+                return
+
+            self.file_store.update_description(user_id, hash_name, description)
+            ulog.info("describe_document: stored description for %s (%d chars)", hash_name, len(description))
+            logger.info("[user_%d] describe_document: stored description for %s (%d chars)", user_id, hash_name, len(description))
+        except Exception as e:
+            ulog.error("describe_document failed for %s: %s", hash_name, e)
+            logger.exception("[user_%d] describe_document failed for %s: %s", user_id, hash_name, e)

@@ -6,8 +6,8 @@
 /data/cache/*
 /data/memory/*
 /data/state/*
-/data/images/*
+/data/files/*
 /data/audio/*
 /data/mcp/*
-/data/documents/*
+/data/tmp/*
 **/__pycache__/*

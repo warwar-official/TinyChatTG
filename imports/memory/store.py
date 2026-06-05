@@ -152,6 +152,11 @@ class MemoryStore:
                     pass
         raise RuntimeError('No compatible qdrant upsert method')
 
+    @property
+    def embed_dimension(self) -> int:
+        """Return the embedding dimension used by this store."""
+        return self._embed_dim or 384
+
     def close(self):
         try:
             if getattr(self, 'qdrant', None):

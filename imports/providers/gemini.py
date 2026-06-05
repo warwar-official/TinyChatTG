@@ -185,8 +185,6 @@ def _convert_gemini_response_to_openai(data: Dict[str, Any]) -> Dict[str, Any]:
 
     for part in parts:
         if part.get("thought"):
-            # Thinking-model parts: {"thought": true, "text": "<the thought text>"}
-            # part["thought"] is a boolean flag — the actual text lives in part["text"]
             reasoning_parts.append(part.get("text") or "")
         elif "text" in part:
             text_parts.append(part["text"])

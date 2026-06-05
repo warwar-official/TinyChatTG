@@ -9,3 +9,5 @@ PyYAML
 pytest
 pytest-asyncio
 pydub
+pypandoc
+PyMuPDF
