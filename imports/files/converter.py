@@ -13,10 +13,8 @@ import logging
 import mimetypes
 import re
 import tempfile
-import fitz
-import pypandoc as pypandoc
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from imports.providers.gemini import GeminiProvider
 
 logger = logging.getLogger(__name__)
@@ -62,15 +60,84 @@ async def convert_office_to_markdown(
 
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
         out_path = Path(tmp.name)
-        await asyncio.to_thread(
-            pypandoc.convert_file,
-            str(src_path),
-            "md",
-            outputfile=str(out_path),
-            extra_args=["--wrap=none", f"--extract-media={media_dir}"],
-        )
-        md_text = out_path.read_text(encoding="utf-8", errors="replace")
-            
+
+    # Prefer using the pypandoc wrapper if available; fall back to CLI async call
+    pypandoc_mod = None
+    try:
+        import pypandoc as _pypandoc  # type: ignore
+        pypandoc_mod = _pypandoc
+    except Exception:
+        pypandoc_mod = None
+
+    try:
+        if pypandoc_mod:
+            try:
+                await asyncio.to_thread(
+                    pypandoc_mod.convert_file,
+                    str(src_path),
+                    "md",
+                    outputfile=str(out_path),
+                    extra_args=["--wrap=none", f"--extract-media={media_dir}"],
+                )
+                md_text = out_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                # fallback to CLI
+                cmd = [
+                    "pandoc",
+                    str(src_path),
+                    "-o", str(out_path),
+                    "--wrap=none",
+                    f"--extract-media={media_dir}",
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+
+                if proc.returncode != 0:
+                    err = stderr.decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"Pandoc failed (exit {proc.returncode}): {err}")
+
+                if stderr:
+                    warn = stderr.decode("utf-8", errors="replace").strip()
+                    if warn:
+                        logger.warning("Pandoc warnings for %s: %s", src_path.name, warn)
+
+                md_text = out_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            # No pypandoc available — call pandoc CLI asynchronously
+            cmd = [
+                "pandoc",
+                str(src_path),
+                "-o", str(out_path),
+                "--wrap=none",
+                f"--extract-media={media_dir}",
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Pandoc failed (exit {proc.returncode}): {err}")
+
+            if stderr:
+                warn = stderr.decode("utf-8", errors="replace").strip()
+                if warn:
+                    logger.warning("Pandoc warnings for %s: %s", src_path.name, warn)
+
+            md_text = out_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     # Walk extracted media — warn about unsupported types
     md_text = _sanitize_media_references(md_text, media_dir, src_path.name)
     return md_text
@@ -108,6 +175,8 @@ async def convert_pdf_to_markdown(
     ocr_model: str = "gemini-3.1-flash-lite",
     dpi: int = 200,
     media_dir: Optional[Path] = None,
+    force_ocr_for_pages: Optional[List[int]] = None,
+    return_report: bool = False,
 ) -> str:
     """Convert a PDF to Markdown using PyMuPDF page rendering + Gemini OCR.
 
@@ -119,7 +188,12 @@ async def convert_pdf_to_markdown(
     Raises RuntimeError on critical processing errors.
     """
 
-    fitz.TOOLS.mupdf_display_errors(False)
+    try:
+        import fitz  # PyMuPDF
+        fitz.TOOLS.mupdf_display_errors(False)
+    except ImportError as e:
+        raise ImportError("PyMuPDF is required for PDF conversion. Install it with: pip install PyMuPDF") from e
+
     doc = fitz.open(str(src_path))
     page_count = len(doc)
     logger.info("PDF conversion: %s has %d pages (DPI=%d)", src_path.name, page_count, dpi)
@@ -139,6 +213,8 @@ async def convert_pdf_to_markdown(
         use_temp_media = True
 
     img_counter = 0
+    force_ocr_for_pages = force_ocr_for_pages or []
+    page_results: List[Dict] = []
     for page_num in range(page_count):
         page = doc.load_page(page_num)
 
@@ -181,8 +257,9 @@ async def convert_pdf_to_markdown(
             page_num + 1, page_count, has_text, has_image, image_coverage,
         )
 
-        # If the page is mostly images, use OCR
-        if image_coverage > 0.7:
+        # Decide whether to OCR this page
+        do_ocr = (page_num + 1) in force_ocr_for_pages or image_coverage > 0.7
+        if do_ocr:
             pix = page.get_pixmap(matrix=mat, alpha=False)
             img_bytes = pix.tobytes("jpeg", jpg_quality=85)
             b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -204,18 +281,27 @@ async def convert_pdf_to_markdown(
                 resp = await gemini_provider.chat(messages, model=ocr_model, timeout=120)
                 if isinstance(resp, dict) and resp.get("error"):
                     logger.warning("PDF OCR: model error on page %d: %s", page_num + 1, resp["error"])
+                    page_results.append({"page": page_num + 1, "method": "ocr", "status": "ocr_failed", "error": resp.get("error"), "content": ""})
                     page_markdowns.append(f"<!-- OCR failed for page {page_num + 1} -->")
                     continue
 
                 choices = resp.get("choices", [])
                 if choices:
                     content = (choices[0].get("message") or {}).get("content") or ""
-                    page_markdowns.append(content.strip())
+                    content = content.strip()
+                    if content:
+                        page_results.append({"page": page_num + 1, "method": "ocr", "status": "ok", "error": "", "content": content})
+                        page_markdowns.append(content)
+                    else:
+                        page_results.append({"page": page_num + 1, "method": "ocr", "status": "empty", "error": "", "content": ""})
+                        page_markdowns.append(f"<!-- empty OCR for page {page_num + 1} -->")
                 else:
+                    page_results.append({"page": page_num + 1, "method": "ocr", "status": "empty", "error": "", "content": ""})
                     page_markdowns.append(f"<!-- empty OCR for page {page_num + 1} -->")
 
             except Exception as e:
                 logger.warning("PDF OCR: exception on page %d: %s", page_num + 1, e)
+                page_results.append({"page": page_num + 1, "method": "ocr", "status": "ocr_failed", "error": str(e), "content": ""})
                 page_markdowns.append(f"<!-- OCR error for page {page_num + 1}: {e} -->")
             continue
 
@@ -275,7 +361,10 @@ async def convert_pdf_to_markdown(
 
         page_text = "\n\n".join(parts).strip()
         if page_text:
+            page_results.append({"page": page_num + 1, "method": "extract", "status": "extracted", "error": "", "content": page_text})
             page_markdowns.append(page_text)
+        else:
+            page_results.append({"page": page_num + 1, "method": "extract", "status": "empty", "error": "", "content": ""})
 
     # Clean up temporary media dir if we created it
     if use_temp_media:
@@ -284,5 +373,19 @@ async def convert_pdf_to_markdown(
         except Exception:
             pass
 
+    md_text = "\n\n---\n\n".join(p for p in page_markdowns if p)
+    # Build report
+    report = {
+        "total_pages": page_count,
+        "pages": page_results,
+        "ocr_pages": sum(1 for p in page_results if p.get("method") == "ocr"),
+        "ocr_failures": sum(1 for p in page_results if p.get("method") == "ocr" and p.get("status") != "ok"),
+        "extracted_pages": sum(1 for p in page_results if p.get("method") == "extract" and p.get("status") == "extracted"),
+        "success_count": sum(1 for p in page_results if p.get("status") in ("ok", "extracted")),
+        "failed_count": sum(1 for p in page_results if p.get("status") not in ("ok", "extracted")),
+    }
+
     doc.close()
-    return "\n\n---\n\n".join(p for p in page_markdowns if p)
+    if return_report:
+        return md_text, report
+    return md_text

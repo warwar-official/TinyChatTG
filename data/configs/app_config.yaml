@@ -2,14 +2,12 @@ providers:
   lmstudio:
     name: lmstudio
     url: null
-    description: "LM Studio local OpenAI-compatible endpoint"
-    default_model: "default_model"
-
+    description: LM Studio local OpenAI-compatible endpoint
+    default_model: default_model
   gemini:
     name: gemini
-    description: "Google Gemini REST API provider"
-    default_model: "gemma-4-31b-it"
-
+    description: Google Gemini REST API provider
+    default_model: gemma-4-31b-it
 models:
   main_model:
     provider: gemini
@@ -17,21 +15,19 @@ models:
   backup_model:
     provider: gemini
     model: gemma-4-26b-a4b-it
-
 mcp:
   TinyMCP:
     enabled: true
-    command: "/home/warwar/Документи/Antigravity/TinyMCP/.venv/bin/python"
+    command: "/home/warwar/\u0414\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0438\
+      /Antigravity/TinyMCP/.venv/bin/python"
     args:
-      - "/home/warwar/Документи/Antigravity/TinyMCP/server.py"
+    - "/home/warwar/\u0414\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0438/Antigravity/TinyMCP/server.py"
     env: {}
-
 memory:
   model_path: data/memory/model
   db_path: data/memory/db
   embedding_model: intfloat/multilingual-e5-large
   max_tool_response_chars: 15000
-
 bot:
   auth_code_ttl_seconds: 60
   max_auth_failures_per_ttl: 5
@@ -41,17 +37,16 @@ bot:
   max_messages: 25
   max_tool_iterations: 10
   summarize_tool_results: false
-
 logging:
   debug: true
   logs_path: logs
-
 concurrency:
   max_concurrent: 1
   requests_per_minute: 15
   primary_workers: 1
-
 whisper:
   url: https://api.groq.com/openai/v1/audio/transcriptions
-  rpm: 20          # Groq free tier: 20 requests per minute
-  max_size: 25000000  # 25 MB — Groq's hard limit per request
+  rpm: 20
+  max_size: 25000000
+auth:
+  expiry_message: Your access expired. Update your plan or use another key.

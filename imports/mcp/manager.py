@@ -209,8 +209,11 @@ class MCPManager:
                 
         # Sync configs
         self.unified_tools = {}
-        # Add app tools first
+        # Add app tools first (ensure default allow_summarizing)
         for tname, tcfg in self.app_tools.items():
+            if not isinstance(tcfg, dict):
+                tcfg = {}
+            tcfg.setdefault('allow_summarizing', True)
             tcfg['_provider'] = 'app'
             self.unified_tools[tname] = tcfg
 
@@ -239,7 +242,7 @@ class MCPManager:
                 # 2.1.3.5 Create new
                 file_cfg = {"tools": {}}
                 for tname in server_tools_map.keys():
-                    file_cfg["tools"][tname] = {"visible": True, "permissions": "ask"}
+                    file_cfg["tools"][tname] = {"visible": True, "permissions": "ask", "allow_summarizing": True}
                 self._add_report(f"Created new config for server {name} with {len(server_tools_map)} tools.")
                 self._save_yaml(config_path, file_cfg)
             else:
@@ -249,7 +252,7 @@ class MCPManager:
                 # Server tools not in config
                 for tname in server_tools_map.keys():
                     if tname not in file_tools:
-                        file_tools[tname] = {"visible": True, "permissions": "ask"}
+                        file_tools[tname] = {"visible": True, "permissions": "ask", "allow_summarizing": True}
                         changed = True
                         self._add_report(f"New tool '{tname}' found on server {name}. Added to config.")
                 
@@ -276,6 +279,7 @@ class MCPManager:
                     "schema": schema,
                     "visible": tcfg.get("visible", True),
                     "permissions": tcfg.get("permissions", "ask"),
+                    "allow_summarizing": tcfg.get("allow_summarizing", True),
                     "_provider": name
                 }
                 self.unified_tools[tname] = unified_tcfg

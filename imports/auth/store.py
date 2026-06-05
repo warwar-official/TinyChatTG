@@ -53,6 +53,15 @@ class AuthStore:
 
     def is_authorized(self, user_id: int) -> bool:
         u = self._get_user(user_id)
+        now = time.time()
+        # Persistent access wins: infinity or unexpired user access
+        access_type = u.get('access_type')
+        access_expires = u.get('access_expires', 0) or 0
+        if access_type == 'infinity':
+            return True
+        if access_type == 'user' and access_expires and access_expires > now:
+            return True
+        # Fallback to ephemeral session authorization (generated codes)
         return bool(u.get('authorized', False))
 
     def generate_code(self, user_id: int, ttl: int = 60) -> str:
@@ -169,3 +178,60 @@ class AuthStore:
         now = time.time()
         bans = self.get_bans(user_id)
         return now < bans.get('message_ban_until', 0)
+
+    def redeem_key(self, user_id: int, key: str) -> dict:
+        """Attempt to redeem a key from the `keys` mapping.
+
+        Returns a dict with at least `ok: bool`. On success returns `type` and `expires_at`.
+        Possible failure reasons: 'not_found', 'expired', 'used_up'.
+        """
+        now = int(time.time())
+        data = self._load()
+        keys = data.setdefault('keys', {})
+        kmeta = keys.get(key)
+        if not kmeta:
+            return {'ok': False, 'reason': 'not_found'}
+
+        ktype = kmeta.get('type', 'user')
+        expires_at = int(kmeta.get('expires_at', 0) or 0)
+        max_uses = int(kmeta.get('max_uses', 0) or 0)
+        uses = int(kmeta.get('uses', 0) or 0)
+
+        # Non-infinity keys may expire
+        if ktype != 'infinity' and expires_at and now > expires_at:
+            return {'ok': False, 'reason': 'expired'}
+
+        # Check usage limit
+        if max_uses > 0 and uses >= max_uses:
+            return {'ok': False, 'reason': 'used_up'}
+
+        # Apply the key to the user
+        u = self._get_user(user_id)
+        if ktype == 'infinity':
+            u['access_type'] = 'infinity'
+            # Use -1 to indicate no expiry (distinct from 0 which migration used for expired)
+            u['access_expires'] = -1
+        else:
+            u['access_type'] = 'user'
+            # honor key expiry (0 means no expiry if set so by the key generator)
+            u['access_expires'] = expires_at
+
+        # mark ephemeral session as authorized as well
+        u['authorized'] = True
+        u['current_code'] = None
+        u['code_expires'] = 0
+        u['code_failures'] = []
+
+        # consume key use
+        kmeta['uses'] = uses + 1
+        if max_uses > 0 and kmeta['uses'] >= max_uses:
+            # remove exhausted key
+            del keys[key]
+        else:
+            keys[key] = kmeta
+
+        data.setdefault('users', {})[str(user_id)] = u
+        data['keys'] = keys
+        self._save(data)
+
+        return {'ok': True, 'type': ktype, 'expires_at': expires_at}

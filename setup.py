@@ -102,6 +102,62 @@ DEFAULT_TOOLS_YAML = """tools:
 """
 
 
+DEFAULT_APP_CONFIG = """providers:
+  gemini:
+    name: gemini
+    description: "Google Gemini REST API provider"
+    default_model: "gemma-4-31b-it"
+
+models:
+  main_model:
+    provider: gemini
+    model: gemma-4-31b-it
+  backup_model:
+    provider: gemini
+    model: gemma-4-26b-a4b-it
+
+mcp:
+  TinyMCP:
+    enabled: true
+    command: ""
+    args: []
+    env: {}
+
+memory:
+  model_path: data/memory/model
+  db_path: data/memory/db
+  embedding_model: intfloat/multilingual-e5-large
+  max_tool_response_chars: 15000
+
+bot:
+  auth_code_ttl_seconds: 60
+  max_auth_failures_per_ttl: 5
+  start_spam_limit_per_minute: 5
+  start_spam_ban_seconds: 3600
+  last_messages_tail: 10
+  max_messages: 25
+  max_tool_iterations: 10
+  summarize_tool_results: true
+
+auth:
+  expiry_message: "Your access expired. Update your plan or use another key."
+
+logging:
+  debug: true
+  logs_path: logs
+
+concurrency:
+  max_concurrent: 1
+  requests_per_minute: 15
+  primary_workers: 1
+
+whisper:
+  url: https://api.groq.com/openai/v1/audio/transcriptions
+  rpm: 20
+  max_size: 25000000
+"""
+
+
 def print_status(msg, status="INFO"):
     colors = {
         "INFO": "\033[94m",
@@ -221,6 +277,38 @@ def cache_fastembed_model():
     except Exception as e:
         print_status(f"Failed to cache fastembed model: {e}", "ERROR")
 
+def ensure_pandoc():
+    """Ensure pandoc is available. Prefer pypandoc's downloader if installed."""
+    try:
+        import pypandoc
+        try:
+            ver = pypandoc.get_pandoc_version()
+            print_status(f"Pandoc already available: {ver}", "INFO")
+            return
+        except Exception:
+            print_status("Pandoc binary not found via pypandoc. Attempting to download...", "INFO")
+            try:
+                pypandoc.download_pandoc()
+                ver = pypandoc.get_pandoc_version()
+                print_status(f"Pandoc downloaded: {ver}", "SUCCESS")
+                return
+            except Exception as e:
+                print_status(f"Failed to download pandoc via pypandoc: {e}", "WARN")
+    except ImportError:
+        print_status("pypandoc not installed; pandoc installation skipped.", "WARN")
+
+
+def create_app_config():
+    cfg_file = Path("data/configs/app_config.yaml")
+    if not cfg_file.exists():
+        print_status("Creating default app_config.yaml...", "INFO")
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_APP_CONFIG)
+        print_status("Created app_config.yaml.", "SUCCESS")
+    else:
+        print_status("app_config.yaml already exists.", "INFO")
+
 
 def main():
     print_status("Starting TinyChatTG Setup", "INFO")
@@ -241,6 +329,10 @@ def main():
 
     # 4. Create default config files
     create_tools_config()
+    create_app_config()
+
+    # 4.5 Ensure pandoc available for document conversions
+    ensure_pandoc()
 
     # 5. Initialize/Cache Models
     cache_fastembed_model()

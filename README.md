@@ -115,3 +115,24 @@ pytest -q
 **Next recommended improvements**
 - Improve error boundaries for MCP subprocess failures.
 - Provide more comprehensive documentation for running and deploying.
+
+**New features (added)**
+- Per-tool summarization control: tools may include `allow_summarizing: true|false` in their MCP/app tool configs. The orchestrator only schedules summaries for tools that allow it.
+- Setup improvements: `setup.py` now ensures default `data/configs/app_config.yaml` and `data/mcp/app_tools.yaml` are created when missing, and attempts to ensure the `pandoc` binary is available via `pypandoc`.
+- Migration script: `migrate_files.py` was extended to migrate file records into the new FileStore payload shape (adds `media_dir`, `corrupted`, and `corrupted_pages` fields), mark existing users as expired `user` access (adds `access_type` and `access_expires` fields), and ensure MCP tool configs contain `allow_summarizing` when missing.
+- Beta key management: A helper script `scripts/create_beta_keys.py` creates keys and inserts them into `data/state/auth.json` under a `keys` mapping. Keys contain `type`, `expires_at`, `max_uses`, and `label` metadata.
+
+**How to create beta keys**
+
+Run the helper script to create keys and add them to the local auth store:
+
+```bash
+python scripts/create_beta_keys.py --count 5 --duration-days 30 --max-uses 10 --label "beta-june"
+```
+
+This will print the generated keys and write them to `data/state/auth.json` under the `keys` section.
+
+**Notes on auth changes**
+- Existing users are marked with `access_type: user` and `access_expires: 0` by the migration (meaning expired). Console/admin keys (in `keys` mapping with type `infinity`) are treated as permanent and can be granted to users manually.
+- The default expiry message is: "Your access expired. Update your plan or use another key." — configurable in `data/configs/app_config.yaml` under `auth.expiry_message`.
+

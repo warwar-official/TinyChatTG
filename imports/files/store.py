@@ -200,6 +200,7 @@ class FileStore:
                 "real_name": existing.get("real_name", ""),
                 "is_new": False,
                 "path": str(self._docs_dir / hash_name),
+                "payload": existing,
             }
         return None
 
@@ -210,6 +211,9 @@ class FileStore:
         real_name: str,
         raw_hash: str,
         media_dir: str = "",
+        corrupted: bool = False,
+        corrupted_pages: Optional[list] = None,
+        overwrite: bool = False,
     ) -> dict:
         """Register a document that was converted to Markdown (from .docx, .pdf, etc.).
 
@@ -223,23 +227,33 @@ class FileStore:
         phys = self._docs_dir / hash_name
 
         is_new_file = not phys.exists()
-        if is_new_file:
+        if is_new_file or overwrite:
             phys.write_bytes(md_bytes)
 
         # If the user already has a record for this exact real_name, update it
         existing = self._find_record_by_real_name(user_id, real_name)
         if existing:
-            # Update media_dir if changed (e.g. re-uploaded)
-            if media_dir and existing.get("media_dir") != media_dir and existing.get("_point_id"):
-                try:
-                    self.qdrant.set_payload(
-                        collection_name=self.FILES_COLLECTION,
-                        payload={"media_dir": media_dir, "hash_name": hash_name, "timestamp": time.time()},
-                        points=[existing["_point_id"]],
-                    )
-                except Exception as e:
-                    logger.warning("register_converted_document: failed to update media_dir: %s", e)
-            return {"hash_name": hash_name, "real_name": real_name, "is_new": False, "path": str(phys)}
+            # Update payload (media_dir, corrupted flags, timestamp)
+            try:
+                if existing.get("_point_id"):
+                    payload_update = {
+                        "media_dir": media_dir,
+                        "hash_name": hash_name,
+                        "timestamp": time.time(),
+                        "corrupted": bool(corrupted),
+                        "corrupted_pages": corrupted_pages or [],
+                    }
+                    try:
+                        self.qdrant.set_payload(
+                            collection_name=self.FILES_COLLECTION,
+                            payload=payload_update,
+                            points=[existing["_point_id"]],
+                        )
+                    except Exception as e:
+                        logger.warning("register_converted_document: failed to update payload: %s", e)
+            except Exception:
+                pass
+            return {"hash_name": hash_name, "real_name": real_name, "is_new": False, "path": str(phys), "payload": existing}
 
         self._upsert_record(
             user_id=user_id,
@@ -249,13 +263,15 @@ class FileStore:
             file_type="document",
             origin="loaded",
             media_dir=media_dir,
+            corrupted=bool(corrupted),
+            corrupted_pages=corrupted_pages or [],
         )
         return {"hash_name": hash_name, "real_name": real_name, "is_new": True, "path": str(phys)}
 
     def _upsert_record(self, user_id: int, hash_name: str, real_name: str,
                        description: str, file_type: str, origin: str,
                        point_id: Optional[str] = None, timestamp: Optional[float] = None,
-                       media_dir: str = ""):
+                       media_dir: str = "", corrupted: bool = False, corrupted_pages: Optional[list] = None):
         if not self._qdrant_ready:
             return
         from qdrant_client.http import models as qmodels
@@ -270,6 +286,8 @@ class FileStore:
             "origin": origin,
             "timestamp": timestamp or time.time(),
             "media_dir": media_dir,
+            "corrupted": bool(corrupted),
+            "corrupted_pages": corrupted_pages or [],
         }
         pt = qmodels.PointStruct(id=pid, vector=vec, payload=payload)
         self._upsert(pt)

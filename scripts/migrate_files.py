@@ -68,6 +68,10 @@ def migrate():
             "type": file_type,
             "origin": "loaded",
             "timestamp": time.time(),
+            # New fields for improved FileStore compatibility
+            "media_dir": "",
+            "corrupted": False,
+            "corrupted_pages": [],
         }
         points.append(qmodels.PointStruct(id=pid, vector=vec, payload=payload))
 
@@ -133,6 +137,86 @@ def migrate():
         print("Migration complete!")
     else:
         print("No files found to migrate.")
+
+    # --- Access migration: mark users as expired 'user' access
+    auth_path = PROJECT_ROOT / "data" / "state" / "auth.json"
+    try:
+        import json, time
+        if auth_path.exists():
+            with open(auth_path, 'r', encoding='utf-8') as f:
+                auth_data = json.load(f) or {}
+        else:
+            auth_data = {}
+
+        users = auth_data.setdefault('users', {})
+        now = time.time()
+        for uid, u in users.items():
+            # Set access type and mark as expired (leave console/admin handling to manual edits)
+            u.setdefault('access_type', 'user')
+            # expired timestamp (0) means expired
+            u['access_expires'] = 0
+            # ensure they are not authorized by default after migration
+            u['authorized'] = False
+        with open(auth_path, 'w', encoding='utf-8') as f:
+            json.dump(auth_data, f, ensure_ascii=False, indent=2)
+        print("Auth migration: marked existing users as expired 'user' access.")
+    except Exception as e:
+        print(f"Auth migration failed: {e}")
+
+    # --- MCP tool configs migration: ensure allow_summarizing present
+    try:
+        import yaml
+        mcp_dir = PROJECT_ROOT / "data" / "mcp"
+        if mcp_dir.exists():
+            for p in mcp_dir.iterdir():
+                if p.suffix.lower() in ('.yaml', '.yml'):
+                    try:
+                        with open(p, 'r', encoding='utf-8') as f:
+                            cfg = yaml.safe_load(f) or {}
+                        tools = cfg.get('tools', {})
+                        changed = False
+                        for tname, tcfg in tools.items():
+                            if not isinstance(tcfg, dict):
+                                tools[tname] = { 'allow_summarizing': True }
+                                changed = True
+                            else:
+                                if 'allow_summarizing' not in tcfg:
+                                    tcfg['allow_summarizing'] = True
+                                    changed = True
+                        if changed:
+                            cfg['tools'] = tools
+                            with open(p, 'w', encoding='utf-8') as f:
+                                yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+                            print(f"Updated MCP config: {p}")
+                    except Exception as e:
+                        print(f"Failed to update MCP config {p}: {e}")
+    except Exception as e:
+        print(f"MCP tools migration failed: {e}")
+
+    # --- app_config migration: add auth.expiry_message and summarize_tool_results default
+    try:
+        import yaml
+        cfg_path = PROJECT_ROOT / "data" / "configs" / "app_config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+        else:
+            cfg = {}
+
+        bot_cfg = cfg.setdefault('bot', {})
+        bot_cfg.setdefault('summarize_tool_results', True)
+        cfg['bot'] = bot_cfg
+
+        auth_cfg = cfg.setdefault('auth', {})
+        auth_cfg.setdefault('expiry_message', "Your access expired. Update your plan or use another key.")
+        cfg['auth'] = auth_cfg
+
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+        print("app_config migration: ensured auth and bot defaults.")
+    except Exception as e:
+        print(f"app_config migration failed: {e}")
 
 if __name__ == "__main__":
     migrate()

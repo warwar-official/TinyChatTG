@@ -587,7 +587,42 @@ async def cmd_stop(message: types.Message):
 async def handle_all(message: types.Message):
     user_id = message.from_user.id
 
-    # Check for auth code reply
+    # Check for auth key (try redeeming a persistent key first)
+    if message.text:
+        txt = message.text.strip()
+        try:
+            res = auth_store.redeem_key(user_id, txt)
+            if isinstance(res, dict) and res.get('ok'):
+                # Granted via key
+                ktype = res.get('type')
+                if ktype == 'infinity':
+                    await message.reply("Authorization complete. You have been granted infinite access.")
+                else:
+                    exp = res.get('expires_at', 0) or 0
+                    if exp:
+                        from datetime import datetime
+                        exp_str = datetime.fromtimestamp(exp).strftime('%Y-%m-%d %H:%M:%S')
+                        await message.reply(f"Authorization complete. Access expires at {exp_str}.")
+                    else:
+                        await message.reply("Authorization complete. Access granted.")
+                get_user_logger(user_id).info("user authorized via key")
+                return
+            else:
+                # if key wasn't found, fall through to numeric code verification
+                if isinstance(res, dict) and res.get('reason') and res.get('reason') != 'not_found':
+                    # Inform user on explicit key failure (expired/used)
+                    reason = res.get('reason')
+                    if reason == 'expired':
+                        await message.reply("This key has expired.")
+                        return
+                    if reason == 'used_up':
+                        await message.reply("This key has already been used the maximum number of times.")
+                        return
+        except Exception:
+            # redemption errors should not block normal code auth flow
+            pass
+
+    # Check for auth code reply (one-time numeric codes)
     if message.text and auth_store.verify_code(user_id, message.text.strip()):
         await message.reply("Authorization complete. You can now use the bot.")
         get_user_logger(user_id).info("user authorized")
@@ -786,6 +821,7 @@ async def handle_all(message: types.Message):
             try:
                 import io
                 from imports.files.converter import convert_office_to_markdown
+                import json
 
                 bio = io.BytesIO()
                 await bot.download(doc, destination=bio)
@@ -796,61 +832,10 @@ async def handle_all(message: types.Message):
 
                 res = file_store.check_converted_document_exists(user_id, raw_hash)
                 if not res:
-                    temp_path = PROJECT_ROOT / "data" / "tmp"
-                    temp_path.mkdir(parents=True, exist_ok=True)
-                    tmp_src = temp_path / f"{doc.file_unique_id}{file_ext}"
-                    tmp_src.write_bytes(raw_bytes)
-
-                    # Determine media directory (named by hash of raw bytes)
-                    media_dir = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"
-
-                    try:
-                        md_text = await convert_office_to_markdown(tmp_src, media_dir)
-                    finally:
-                        try:
-                            tmp_src.unlink()
-                        except Exception:
-                            pass
-
-                    md_bytes = md_text.encode("utf-8")
-                    res = file_store.register_converted_document(
-                        user_id, md_bytes, clean_name, raw_hash=raw_hash, media_dir=str(media_dir)
-                    )
-                else:
-                    with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
-                        md_text = f.read()
-
-                if len(md_text) <= 15000:
-                    file_context = f"[File from user: {clean_name}]\n{md_text}"
-                else:
-                    file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
-
-                if res.get("is_new"):
-                    asyncio.create_task(
-                        orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
-                    )
-            except Exception as e:
-                get_user_logger(user_id).warning("Failed to process office document: %s", e)
-                await message.reply(f"Failed to convert document: {e}")
-                return
-
-        elif is_pdf:
-            # ── PDF via PyMuPDF + Gemini OCR ────────────────────────────────
-            try:
-                import io
-                from imports.files.converter import convert_pdf_to_markdown
-
-                import hashlib
-                raw_hash = hashlib.sha256(raw_bytes).hexdigest()
-                
-                res = file_store.check_converted_document_exists(user_id, raw_hash)
-                
-                # If we don't have it, perform OCR
-                if not res:
                     # Notify user that processing is starting
                     proc_msg = await bot.send_message(message.chat.id, "📄 File processing. Please wait...")
 
-                    # Switch chat action to "upload_document" during OCR
+                    # Switch chat action to "upload_document" during processing
                     async def _keep_upload_action(cid: int, interval: float = 4.0):
                         try:
                             while True:
@@ -867,17 +852,14 @@ async def handle_all(message: types.Message):
                     try:
                         temp_path = PROJECT_ROOT / "data" / "tmp"
                         temp_path.mkdir(parents=True, exist_ok=True)
-                        tmp_src = temp_path / f"{doc.file_unique_id}.pdf"
+                        tmp_src = temp_path / f"{doc.file_unique_id}{file_ext}"
                         tmp_src.write_bytes(raw_bytes)
 
                         # Determine media directory (named by hash of raw bytes)
                         media_dir = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"
+
                         try:
-                            md_text = await convert_pdf_to_markdown(
-                                tmp_src,
-                                gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
-                                media_dir=media_dir,
-                            )
+                            md_text = await convert_office_to_markdown(tmp_src, media_dir)
                         finally:
                             try:
                                 tmp_src.unlink()
@@ -914,8 +896,245 @@ async def handle_all(message: types.Message):
                         orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
                     )
             except Exception as e:
+                get_user_logger(user_id).warning("Failed to process office document: %s", e)
+                await message.reply(f"Failed to convert document: {e}")
+                return
+
+        elif is_pdf:
+            # ── PDF via PyMuPDF + Gemini OCR ────────────────────────────────
+            try:
+                import io
+                import json
+                from imports.files.converter import convert_pdf_to_markdown
+
+                import hashlib
+                raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+                res = file_store.check_converted_document_exists(user_id, raw_hash)
+
+                # If converted already exists, possibly retry corrupted pages
+                if res:
+                    payload = res.get("payload") or {}
+                    if payload.get("corrupted") and payload.get("corrupted_pages"):
+                        corrupted_pages = payload.get("corrupted_pages") or []
+
+                        # Notify user that retry is starting
+                        proc_msg = await bot.send_message(message.chat.id, "📄 Retrying OCR for corrupted pages. Please wait...")
+
+                        async def _keep_upload_action(cid: int, interval: float = 4.0):
+                            try:
+                                while True:
+                                    try:
+                                        await bot.send_chat_action(cid, "upload_document")
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(interval)
+                            except asyncio.CancelledError:
+                                return
+
+                        upload_action_task = asyncio.create_task(_keep_upload_action(message.chat.id))
+
+                        try:
+                            temp_path = PROJECT_ROOT / "data" / "tmp"
+                            temp_path.mkdir(parents=True, exist_ok=True)
+                            tmp_src = temp_path / f"{doc.file_unique_id}.pdf"
+                            tmp_src.write_bytes(raw_bytes)
+
+                            media_dir = Path(payload.get("media_dir") or (PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"))
+
+                            try:
+                                new_md_text, new_report = await convert_pdf_to_markdown(
+                                    tmp_src,
+                                    gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
+                                    media_dir=media_dir,
+                                    force_ocr_for_pages=corrupted_pages,
+                                    return_report=True,
+                                )
+                            finally:
+                                try:
+                                    tmp_src.unlink()
+                                except Exception:
+                                    pass
+                        finally:
+                            upload_action_task.cancel()
+                            try:
+                                await upload_action_task
+                            except Exception:
+                                pass
+
+                        # Delete the "processing" message
+                        try:
+                            await bot.delete_message(message.chat.id, proc_msg.message_id)
+                        except Exception:
+                            pass
+
+                        # Load existing pages sidecar (if present)
+                        pages_file = Path(res["path"]).with_name(raw_hash + "_pages.json")
+                        existing_pages = []
+                        try:
+                            if pages_file.exists():
+                                with open(pages_file, 'r', encoding='utf-8') as fh:
+                                    existing_pages = json.load(fh)
+                        except Exception:
+                            existing_pages = []
+
+                        total_pages = new_report.get("total_pages", 0)
+                        if not existing_pages or len(existing_pages) != total_pages:
+                            try:
+                                with open(res["path"], 'r', encoding='utf-8', errors='replace') as fh:
+                                    stored_md = fh.read()
+                                parts = stored_md.split("\n\n---\n\n")
+                                existing_pages = []
+                                for i in range(total_pages):
+                                    content = parts[i] if i < len(parts) else ""
+                                    existing_pages.append({"page": i+1, "content": content, "status": ("extracted" if content else "empty")})
+                            except Exception:
+                                existing_pages = [{"page": i+1, "content": "", "status": "empty"} for i in range(total_pages)]
+
+                        # Check whether all previously corrupted pages were fixed
+                        all_fixed = True
+                        for pg in corrupted_pages:
+                            rpt = next((p for p in new_report.get("pages", []) if p.get("page") == pg), None)
+                            if not rpt or rpt.get("status") != "ok":
+                                all_fixed = False
+                                break
+
+                        if all_fixed:
+                            # Merge pages into existing_pages and write merged md
+                            for rpt in new_report.get("pages", []):
+                                pnum = rpt.get("page")
+                                if pnum in corrupted_pages:
+                                    idx = pnum - 1
+                                    existing_pages[idx]["content"] = rpt.get("content", "")
+                                    existing_pages[idx]["status"] = rpt.get("status")
+
+                            merged_parts = [p.get("content", "") for p in existing_pages]
+                            merged_md = "\n\n---\n\n".join([m for m in merged_parts if m])
+                            try:
+                                with open(res["path"], 'w', encoding='utf-8') as fh:
+                                    fh.write(merged_md)
+                                with open(pages_file, 'w', encoding='utf-8') as fh:
+                                    json.dump(existing_pages, fh, ensure_ascii=False)
+                                md_bytes = merged_md.encode('utf-8')
+                                file_store.register_converted_document(
+                                    user_id, md_bytes, clean_name, raw_hash=raw_hash, media_dir=str(media_dir), corrupted=False, corrupted_pages=[], overwrite=True
+                                )
+                            except Exception as e:
+                                get_user_logger(user_id).warning("Failed to merge reprocessed pages: %s", e)
+                                await message.reply("Failed to merge reprocessed pages. The previous version is kept.")
+                        else:
+                            try:
+                                await message.reply("Retrying OCR did not fix corrupted pages. Keeping previous converted file.")
+                            except Exception:
+                                pass
+                            try:
+                                asyncio.create_task(
+                                    orchestrator.queue_conversion_failure(user_id, clean_name, f"Retry OCR failed for pages: {corrupted_pages}")
+                                )
+                            except Exception:
+                                pass
+
+                        with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
+                            md_text = f.read()
+                    else:
+                        with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
+                            md_text = f.read()
+                else:
+                    # If we don't have it, perform OCR
+                    proc_msg = await bot.send_message(message.chat.id, "📄 File processing. Please wait...")
+
+                    async def _keep_upload_action(cid: int, interval: float = 4.0):
+                        try:
+                            while True:
+                                try:
+                                    await bot.send_chat_action(cid, "upload_document")
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(interval)
+                        except asyncio.CancelledError:
+                            return
+
+                    upload_action_task = asyncio.create_task(_keep_upload_action(message.chat.id))
+
+                    try:
+                        temp_path = PROJECT_ROOT / "data" / "tmp"
+                        temp_path.mkdir(parents=True, exist_ok=True)
+                        tmp_src = temp_path / f"{doc.file_unique_id}.pdf"
+                        tmp_src.write_bytes(raw_bytes)
+
+                        media_dir = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / "media"
+                        try:
+                            md_text, report = await convert_pdf_to_markdown(
+                                tmp_src,
+                                gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
+                                media_dir=media_dir,
+                                return_report=True,
+                            )
+                        finally:
+                            try:
+                                tmp_src.unlink()
+                            except Exception:
+                                pass
+                    finally:
+                        upload_action_task.cancel()
+                        try:
+                            await upload_action_task
+                        except Exception:
+                            pass
+
+                    try:
+                        await bot.delete_message(message.chat.id, proc_msg.message_id)
+                    except Exception:
+                        pass
+
+                    total_pages = report.get("total_pages", 0)
+                    ocr_pages = report.get("ocr_pages", 0)
+                    ocr_failures = report.get("ocr_failures", 0)
+                    success_count = report.get("success_count", 0)
+
+                    pages_file = PROJECT_ROOT / "data" / "files" / "documents" / raw_hash / f"{raw_hash}_pages.json"
+                    try:
+                        pages_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(pages_file, 'w', encoding='utf-8') as fh:
+                            json.dump(report.get('pages', []), fh, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+                    if ocr_pages == total_pages and ocr_failures > (total_pages / 2):
+                        try:
+                            await message.reply("Failed to process PDF: OCR failed for majority of pages. Please provide a clearer scan or try again.")
+                        except Exception:
+                            pass
+                        try:
+                            asyncio.create_task(
+                                orchestrator.queue_conversion_failure(user_id, clean_name, f"OCR failed for {ocr_failures}/{total_pages} pages")
+                            )
+                        except Exception:
+                            pass
+                        md_text = ""
+                        res = {}
+                    else:
+                        corrupted = False
+                        corrupted_pages = []
+                        if total_pages and (success_count > (total_pages / 2)) and report.get('failed_count', 0) > 0:
+                            corrupted = True
+                            corrupted_pages = [p.get('page') for p in report.get('pages', []) if p.get('status') not in ("ok", "extracted")]
+
+                        md_bytes = md_text.encode("utf-8")
+                        res = file_store.register_converted_document(
+                            user_id, md_bytes, clean_name, raw_hash=raw_hash, media_dir=str(media_dir), corrupted=corrupted, corrupted_pages=corrupted_pages
+                        )
+                if len(md_text) <= 15000:
+                    file_context = f"[File from user: {clean_name}]\n{md_text}"
+                else:
+                    file_context = f"[File from user: {clean_name}]\nFile is too big to incontext view, so model should use tools for access to it."
+
+                if res.get("is_new"):
+                    asyncio.create_task(
+                        orchestrator.queue_document_describe(user_id, res["hash_name"], res["real_name"], message.text or getattr(message, 'caption', None) or "")
+                    )
+            except Exception as e:
                 get_user_logger(user_id).warning("Failed to process PDF: %s", e)
-                # Clean up the processing message if still around
                 try:
                     await bot.delete_message(message.chat.id, proc_msg.message_id)
                 except Exception:

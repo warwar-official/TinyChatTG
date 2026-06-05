@@ -818,8 +818,9 @@ class Orchestrator:
                 except Exception as e:
                     ulog.error("Failed to append tool result: %s", e)
 
-                # If tool result is long, schedule summarization on secondary queue
-                if self.summarize_tool_results and len(text_result) > 3000:
+                # If tool result is long and the tool allows summarization, schedule summarization
+                allow_sum = True if not isinstance(tool_conf, dict) else tool_conf.get('allow_summarizing', True)
+                if self.summarize_tool_results and allow_sum and len(text_result) > 3000:
                     await self.primary_queue.put({
                         "coro": self._summarize_tool_result(user_id, tool_name, text_result)
                     })
@@ -1151,6 +1152,27 @@ class Orchestrator:
             await self.primary_queue.put({"coro": coro})
         except Exception as e:
             logger.warning("Failed to queue document describe: %s", e)
+
+    async def queue_conversion_failure(self, user_id: int, real_name: str, reason: str = ""):
+        """Enqueue a background job that notifies the model about a conversion failure."""
+        try:
+            coro = self._notify_conversion_failure(user_id, real_name, reason)
+            await self.primary_queue.put({"coro": coro})
+        except Exception as e:
+            logger.warning("Failed to queue conversion failure notify: %s", e)
+
+    async def _notify_conversion_failure(self, user_id: int, real_name: str, reason: str = ""):
+        """Background job: send a short notification to the model that a document conversion failed."""
+        ulog = get_user_logger(user_id)
+        try:
+            messages = [
+                {"role": "system", "content": self.personality_prompt},
+                {"role": "user", "content": f"Document conversion failed for '{real_name}'. Reason: {reason}. Please note this failure for downstream processing."},
+            ]
+            resp = await self._chat_with_fallback(messages, user_id=user_id, timeout=60)
+            ulog.info("Notified model about conversion failure for %s: %s", real_name, str(resp)[:200])
+        except Exception as e:
+            logger.warning("_notify_conversion_failure failed: %s", e)
 
     async def _describe_image(self, user_id: int, hash_name: str, real_name: str, user_text: str):
         """Background coro: send image to model and store resulting description."""
