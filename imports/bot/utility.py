@@ -1,7 +1,7 @@
-"""
-Utility function for Telegram bot.
-Cleans up and formats messages, handles provider selection, and other helper functions for the bot's operation.
-"""
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
 
 import re
 import html

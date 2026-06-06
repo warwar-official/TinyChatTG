@@ -1,7 +1,7 @@
-"""Minimal aiogram-based bot skeleton integrating LM Studio provider and MemoryStore.
-
-This is a starting point: auth flow, text/image handling, `/new` command, and typing indicator.
-"""
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
 
 import asyncio
 import hashlib
@@ -469,7 +469,7 @@ async def handle_all(message: types.Message):
             await message.reply('Unknown command')
             return
 
-    # For audio and video, they are file types that are not supported.
+    # For unsupported file types, reply with an error message instead of ignoring silently or crashing
     if message.content_type in ("audio", "video", "video_note", "poll"):
         await message.reply("File type does not suported")
         return

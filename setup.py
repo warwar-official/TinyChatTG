@@ -1,3 +1,8 @@
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
+
 import os
 import sys
 import subprocess
@@ -7,7 +12,9 @@ from pathlib import Path
 DIRS = [
     "data/state",
     "data/configs",
-    "data/images",
+    "data/files/documents",
+    "data/files/images",
+    "data/audio",
     "data/mcp",
     "data/memory/db",
     "data/memory/model",
@@ -16,93 +23,186 @@ DIRS = [
 
 # Default tools config
 DEFAULT_TOOLS_YAML = """tools:
-  remember_info:
-    description: Manually add memory entry to the memory store to remember facts or user preferences. Text must be between 50 and 350 characters long and contain alphabetical letters.
-    handler: remember_info.add_memory
-    require_approval: false
-    schema:
-      properties:
-        text:
-          type: string
-        title:
-          type: string
-      required:
-      - text
-      - title
-      type: object
-    visible: true
-  recall_info:
-    description: Search the user's memory store to recall facts, user preferences, or past conversation summaries
-    handler: recall_info.search_memory
-    require_approval: false
-    schema:
-      properties:
-        query:
-          type: string
-          description: Search query
-        limit:
-          type: integer
-          description: Max number of results to return
-      required:
-      - query
-      type: object
-    visible: true
-      type: object
-    visible: true
   file_list:
-    description: Show list of files in user's directory from newest to oldest. Returns total count of files and range shown.
+    description: List all files owned by the user (documents and images). Shows file
+      name, type, origin (loaded or created), and last modified time.
     handler: file_list.list_files
     require_approval: false
     schema:
       properties:
         start_id:
           type: integer
-          description: Index to start listing files from (0-indexed).
+          description: ID of the first file to return (default 0).
         count:
           type: integer
-          description: Max number of files to return (maximum 20).
+          description: Number of files to return (max 20, default 20).
       type: object
     visible: true
+    allow_summarizing: false
   file_read_lines:
-    description: Return lines from a requested text file in the user's directory. Returns total lines, range shown, lines content, and end of file mark if reached.
+    description: 'Read lines from a file. Use this for reading text documents. It
+      returns lines prefixed with line numbers (e.g. ''1: line content'').'
     handler: file_read_lines.read_file_lines
     require_approval: false
     schema:
       properties:
         file_name:
           type: string
-          description: The exact name of the file to read (must not contain path separators or traversal marks).
+          description: The name of the file to read.
         start_id:
           type: integer
-          description: The 1-based line number to start reading from.
+          description: Start line number (1-based, inclusive, default 1).
         count:
           type: integer
-          description: Max number of lines to return (maximum 50).
+          description: Number of lines to read (max 50, default 50).
       required:
       - file_name
       type: object
     visible: true
-  file_search:
-    description: Search for a query string in a file from the user's directory. Returns line numbers and snippets around match (max 50 results).
-    handler: file_search.search_file
+    allow_summarizing: false
+  file_grep:
+    description: Search for a specific text string inside a file. Use this to quickly
+      locate keywords in large text files.
+    handler: file_grep.grep_file
     require_approval: false
     schema:
       properties:
         file_name:
           type: string
-          description: The exact name of the file to search in (must not contain path separators or traversal marks).
+          description: The name of the file to search.
         query:
           type: string
-          description: The query sequence to search for.
+          description: The exact text to search for.
       required:
       - file_name
       - query
       type: object
     visible: true
+    allow_summarizing: false
+  file_find_by_name:
+    description: Search for files by name. Matches if the query is a substring of
+      the file name.
+    handler: file_find_by_name.find_by_name
+    require_approval: false
+    schema:
+      properties:
+        query:
+          type: string
+          description: Substring to search for in file names.
+        limit:
+          type: integer
+          description: Max number of results to return (default 10).
+      required:
+      - query
+      type: object
+    visible: true
+    allow_summarizing: false
+  file_find_by_similarity:
+    description: Search for files (documents or images) by semantic similarity to
+      their model-generated descriptions.
+    handler: file_find_by_similarity.find_by_similarity
+    require_approval: false
+    schema:
+      properties:
+        query:
+          type: string
+          description: Search query describing the content you're looking for.
+        top_k:
+          type: integer
+          description: Number of top matches to return (default 5).
+      required:
+      - query
+      type: object
+    visible: true
+    allow_summarizing: true
+  file_create:
+    description: Create a new empty text document.
+    handler: file_create.create_file
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: Name of the new file to create. Must not already exist.
+      required:
+      - file_name
+      type: object
+    visible: true
+    allow_summarizing: false
+  file_add_lines:
+    description: Append lines to the end of a file. If the file is 'loaded' (read-only),
+      it will automatically be duplicated to an editable 'created' copy first.
+    handler: file_add_lines.add_lines
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: Name of the file.
+        lines:
+          type: array
+          items:
+            type: string
+          description: List of strings to append as lines.
+      required:
+      - file_name
+      - lines
+      type: object
+    visible: true
+    allow_summarizing: false
+  file_replace_lines:
+    description: Replace lines in a file starting at a specific line number. If the
+      file is 'loaded' (read-only), it will automatically be duplicated to an editable
+      'created' copy first.
+    handler: file_replace_lines.replace_lines
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: Name of the file.
+        line_id:
+          type: integer
+          description: The 1-based line number to start replacing at. If beyond EOF,
+            it appends.
+        lines:
+          type: array
+          items:
+            type: string
+          description: List of strings to insert.
+      required:
+      - file_name
+      - line_id
+      - lines
+      type: object
+    visible: true
+    allow_summarizing: false
+  file_send:
+    description: Send a created file back to the user. Note: Only files
+      with origin='created' can be sent. 'loaded' files cannot be sent back.
+    handler: file_send.send_file
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: Name of the file to send.
+      required:
+      - file_name
+      type: object
+    visible: true
+    allow_summarizing: true
+
 """
 
 
 DEFAULT_APP_CONFIG = """providers:
+  lmstudio:
+    name: lmstudio
+    url: null
+    description: LM Studio local OpenAI-compatible endpoint
+    default_model: default_model
+
   gemini:
     name: gemini
     description: "Google Gemini REST API provider"
@@ -138,9 +238,6 @@ bot:
   max_messages: 25
   max_tool_iterations: 10
   summarize_tool_results: true
-
-auth:
-  expiry_message: "Your access expired. Update your plan or use another key."
 
 logging:
   debug: true
@@ -279,23 +376,14 @@ def cache_fastembed_model():
 
 def ensure_pandoc():
     """Ensure pandoc is available. Prefer pypandoc's downloader if installed."""
+    import pypandoc
     try:
-        import pypandoc
-        try:
-            ver = pypandoc.get_pandoc_version()
-            print_status(f"Pandoc already available: {ver}", "INFO")
-            return
-        except Exception:
-            print_status("Pandoc binary not found via pypandoc. Attempting to download...", "INFO")
-            try:
-                pypandoc.download_pandoc()
-                ver = pypandoc.get_pandoc_version()
-                print_status(f"Pandoc downloaded: {ver}", "SUCCESS")
-                return
-            except Exception as e:
-                print_status(f"Failed to download pandoc via pypandoc: {e}", "WARN")
-    except ImportError:
-        print_status("pypandoc not installed; pandoc installation skipped.", "WARN")
+        ver = pypandoc.get_pandoc_version()
+        print_status(f"Pandoc already available: {ver}", "INFO")
+        return
+    except Exception:
+        print_status("Pandoc binary not found via pypandoc. This is required for document conversions. Install it manually.", "WARN")
+    print_status("pypandoc not installed; pandoc installation skipped.", "WARN")
 
 
 def create_app_config():

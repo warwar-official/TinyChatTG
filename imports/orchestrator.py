@@ -14,8 +14,6 @@ from imports.config import get_provider
 from imports.providers.gemini import GeminiProvider
 from imports.providers.lm_studio import LMStudioProvider
 
-from imports.tools.remember_info import add_memory as mm_add
-from imports.tools.recall_info import search_memory as ms_search
 from imports.tools.file_list import list_files as fl_list
 from imports.tools.file_read_lines import read_file_lines as fl_read
 from imports.tools.file_grep import grep_file as fl_grep
@@ -846,8 +844,6 @@ class Orchestrator:
             handler = tool_conf.get('handler')
             fs = self.file_store
             dispatch = {
-                'remember_info.add_memory': lambda: mm_add(self.mem_store, user_id, tool_args),
-                'recall_info.search_memory': lambda: ms_search(self.mem_store, user_id, tool_args),
                 'file_list.list_files': lambda: fl_list(fs, user_id, tool_args),
                 'file_read_lines.read_file_lines': lambda: fl_read(fs, user_id, tool_args),
                 'file_grep.grep_file': lambda: fl_grep(fs, user_id, tool_args),
@@ -859,12 +855,6 @@ class Orchestrator:
                 'file_send.send_file': lambda: fl_send(fs, user_id, tool_args),
             }
             fn = dispatch.get(handler)
-            # Fallback for older configs without the full module.function name
-            if not fn and handler:
-                if 'remember_info' in handler:
-                    fn = lambda: mm_add(self.mem_store, user_id, tool_args)
-                elif 'memory_search' in handler or 'recall_info' in handler:
-                    fn = lambda: ms_search(self.mem_store, user_id, tool_args)
 
             if fn:
                 try:

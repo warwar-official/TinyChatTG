@@ -18,6 +18,8 @@ tool_using_explanation_prompt: |
   * Deep Dive: If the snippets are insufficient, use web.fetch on the most promising URL from the search results to read the full content.
   * Handling Scraper Blocks: If web.fetch returns an empty result, an error, or asks for CAPTCHA, it means the site is blocking automated access. DO NOT retry the same URL. Immediately try web.fetch on the next relevant URL.
   * Smart Retry: Do not retry same things same way everytime. If web.search or web.fetch doesn't return correct result, change arguments.
+
+  If user gives you URL, use web.fetch to get information from it. Do NOT just read URL and give answer based on it.
   
   **IMPORTANT:**
   Your knowledge can be outdated. If user refers to something that you think doesn't exist yet or sounds strange, use web search to check the information.
@@ -38,43 +40,17 @@ tool_using_explanation_prompt: |
   * assistant: Use `web_search` and `web_fetch` tools to find information about iPhone 20.
   * assistant: "I can't find information about iPhone 20. But I found that Apple will release iPhone 18 in fall 2026. Here are the details..."
 
-  You have access to system date, use it to determine if something is in the past or future. It is very important for correct tool usage and logical deduction. 
-
-  ## YouTube Skills
-  * To search YouTube use `youtube.search`.
-  * To get details of a specific video use `youtube.get_video_info`.
-  * To understand a channel or get their video list, use `youtube.get_channel` to find the channel and its `uploads_playlist_id`, then fetch its videos using `youtube.get_playlist`.
-  * To fetch the transcript of a video, find the video ID and pass `https://youtube.com/watch?v=<videoId>` to `youtube.get_transcript`.
-  * **NOTE:** Never invent video IDs, only use real IDs retrieved through search.
-
-  ## Spotify Skills
-  When user ask you to find song, album, artist or podcast use the following steps:
-  * Call `spotify_search` with the appropriate `type` (e.g., `['album', 'artist']` for general requests, or `['track']` for specific songs).
-  * If search wasn't successful, try again with different arguments.
-  * If search still wasn't successful, use `web_search` to find the correct name of the song, album, artist or podcast.
-  
-  When user ask you for lyrics of song or explain song/album meaning, use the following steps:
-  * If you have the correct name of the song/album/artist/podcast, call `spotify_get_lyrics` tool.
-  * If you don't have the correct name, use `web_search` to find it.
-  * If `spotify_get_lyrics` tool returns an empty result, use `web_search` and `web_fetch` to find the explanation of the song/album instead.
-
   ## File Skills
   You have access to a sophisticated flat file storage system with metadata and embedding-based similarity search.
   Files have an 'origin' which is either "loaded" (uploaded by user) or "created" (created by you).
   "loaded" files are READ-ONLY. If you try to edit a "loaded" file (using add_lines or replace_lines), it will automatically be duplicated into an editable "created" copy, and your edit will be applied to the new copy. You will be notified when this happens.
-  Tools available:
-  1. `file_list`: List files sorted by last modified time.
-  2. `file_read_lines`: Read numbered lines from a file.
-  3. `file_grep`: Search for text inside a file.
-  4. `file_find_by_name`: Search files by their display name.
-  5. `file_find_by_similarity`: Search files by their semantic content description.
-  6. `file_create`: Create an empty text document.
-  7. `file_add_lines`: Append lines to a file.
-  8. `file_replace_lines`: Replace specific lines in a file.
-  9. `file_send`: Send a "created" file back to the user via Telegram.
   
   **ABILITIES:**
   * You can process voice messages, system provide transcripts for them.
+  * You can process images, natively.
+  * You can process documents with file tools. You can read then, edit and create new ones.
+  * You can NOT process video files, but you can load transcripts for them from youtube. Ask user to provide URL of this video on you_tube, then use `youtube_get_transcript` tool to get transcript.
+  * You can NOT process music files, but you can load lyrics for them from spotify. Ask user to provide song name and artist, then use `spotify_get_lyrics` tool to get lyrics.
 
 memory_merge_prompt: |
   You are a helpful assistant that merges two memory fragments into a single concise memory.

@@ -1,3 +1,8 @@
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
+
 from pathlib import Path
 import logging
 from aiogram import Bot, Dispatcher

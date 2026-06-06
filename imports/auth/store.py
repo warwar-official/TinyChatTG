@@ -191,21 +191,24 @@ class AuthStore:
 
         return response
 
-    def generate_code(self, type: str = 'user', ttl: int = 3600, max_uses: int = 1) -> str:
+    def generate_code(self, type: str = 'user', ttl: int = 3600, max_uses: int = 1, label: str = "") -> str:
         """Generate a new code and save it to the `keys` mapping with metadata."""
         code = self._generate_random_code()
         if type == 'infinity':
             expires_at = 0
             max_uses = 0
+            label = label or "infinity"
         else:
             expires_at = int(time.time()) + ttl
+            label = label or f"{type}_{expires_at}"
         data = self._load()
         keys = data.setdefault('keys', {})
         keys[code] = {
             'type': type,
             'expires_at': expires_at,
             'max_uses': max_uses,
-            'uses': 0
+            'uses': 0,
+            'label': label
         }
         self._save(data)
         return code
