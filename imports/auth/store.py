@@ -1,8 +1,13 @@
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
+
 import json
 import time
+import secrets
 from pathlib import Path
 from typing import Any, Dict
-
 
 class AuthStore:
     """Persistent auth and ban store saved as JSON under data/state/auth.json"""
@@ -35,9 +40,6 @@ class AuthStore:
         if not u:
             u = {
                 'authorized': False,
-                'current_code': None,
-                'code_expires': 0,
-                'code_generated_at': 0,
                 'code_failures': [],
                 'start_attempts': [],
                 'bans': {
@@ -51,6 +53,9 @@ class AuthStore:
             self._save(data)
         return u
 
+    def _generate_random_code(self, length: int = 24) -> str:
+        return secrets.token_urlsafe(length)[:length]
+
     def is_authorized(self, user_id: int) -> bool:
         u = self._get_user(user_id)
         now = time.time()
@@ -63,60 +68,6 @@ class AuthStore:
             return True
         # Fallback to ephemeral session authorization (generated codes)
         return bool(u.get('authorized', False))
-
-    def generate_code(self, user_id: int, ttl: int = 60) -> str:
-        now = time.time()
-        u = self._get_user(user_id)
-        bans = u.get('bans', {}) or {}
-        if now < bans.get('start_ban_until', 0):
-            raise PermissionError('start_banned')
-        if now < bans.get('code_ban_until', 0):
-            raise PermissionError('code_banned')
-
-        last_gen = u.get('code_generated_at', 0) or 0
-        if now - last_gen < 60:
-            raise PermissionError('code_rate_limited')
-
-        import random
-        code = f"{random.randint(100000, 999999)}"
-        u['current_code'] = code
-        u['code_expires'] = now + ttl
-        u['code_generated_at'] = now
-        # reset recent failures
-        u['code_failures'] = []
-        data = self._load()
-        data.setdefault('users', {})[str(user_id)] = u
-        self._save(data)
-        return code
-
-    def verify_code(self, user_id: int, code: str, max_failures: int = 5, fail_window: int = 60) -> bool:
-        now = time.time()
-        u = self._get_user(user_id)
-        expected = u.get('current_code')
-        expires = u.get('code_expires', 0)
-        if expected and code and str(code).strip() == str(expected) and now <= expires:
-            u['authorized'] = True
-            u['current_code'] = None
-            u['code_expires'] = 0
-            u['code_failures'] = []
-            data = self._load()
-            data.setdefault('users', {})[str(user_id)] = u
-            self._save(data)
-            return True
-
-        # failure
-        failures = u.get('code_failures') or []
-        failures = [t for t in failures if now - t <= fail_window]
-        failures.append(now)
-        u['code_failures'] = failures
-        # if too many failures within window, set code_ban
-        if len(failures) >= max_failures:
-            u.setdefault('bans', {})['code_ban_until'] = now + fail_window
-
-        data = self._load()
-        data.setdefault('users', {})[str(user_id)] = u
-        self._save(data)
-        return False
 
     def add_start_attempt(self, user_id: int, window: int = 60, limit: int = 5, ban_seconds: int = 3600) -> None:
         now = time.time()
@@ -174,64 +125,87 @@ class AuthStore:
         self._save(data)
         return {'banned': False, 'reason': None}
 
-    def is_message_banned(self, user_id: int) -> bool:
-        now = time.time()
-        bans = self.get_bans(user_id)
-        return now < bans.get('message_ban_until', 0)
-
-    def redeem_key(self, user_id: int, key: str) -> dict:
+    def redeem_key(self, user_id: int, key: str, max_failures: int = 5, fail_window: int = 60) -> dict:
         """Attempt to redeem a key from the `keys` mapping.
 
         Returns a dict with at least `ok: bool`. On success returns `type` and `expires_at`.
         Possible failure reasons: 'not_found', 'expired', 'used_up'.
         """
+        response = {'ok': False, 'reason': None}
+
         now = int(time.time())
         data = self._load()
         keys = data.setdefault('keys', {})
         kmeta = keys.get(key)
-        if not kmeta:
-            return {'ok': False, 'reason': 'not_found'}
-
-        ktype = kmeta.get('type', 'user')
-        expires_at = int(kmeta.get('expires_at', 0) or 0)
-        max_uses = int(kmeta.get('max_uses', 0) or 0)
-        uses = int(kmeta.get('uses', 0) or 0)
-
-        # Non-infinity keys may expire
-        if ktype != 'infinity' and expires_at and now > expires_at:
-            return {'ok': False, 'reason': 'expired'}
-
-        # Check usage limit
-        if max_uses > 0 and uses >= max_uses:
-            return {'ok': False, 'reason': 'used_up'}
-
-        # Apply the key to the user
         u = self._get_user(user_id)
-        if ktype == 'infinity':
-            u['access_type'] = 'infinity'
-            # Use -1 to indicate no expiry (distinct from 0 which migration used for expired)
-            u['access_expires'] = -1
-        else:
-            u['access_type'] = 'user'
-            # honor key expiry (0 means no expiry if set so by the key generator)
-            u['access_expires'] = expires_at
 
-        # mark ephemeral session as authorized as well
-        u['authorized'] = True
-        u['current_code'] = None
-        u['code_expires'] = 0
-        u['code_failures'] = []
-
-        # consume key use
-        kmeta['uses'] = uses + 1
-        if max_uses > 0 and kmeta['uses'] >= max_uses:
-            # remove exhausted key
-            del keys[key]
+        if not kmeta:
+            response = {'ok': False, 'reason': 'not_found'}
         else:
-            keys[key] = kmeta
+            ktype = kmeta.get('type', 'user')
+            expires_at = int(kmeta.get('expires_at', 0) or 0)
+            max_uses = int(kmeta.get('max_uses', 0) or 0)
+            uses = int(kmeta.get('uses', 0) or 0)
+
+            # Non-infinity keys may expire
+            if ktype != 'infinity' and expires_at and now > expires_at:
+                response = {'ok': False, 'reason': 'expired'}
+            # Check usage limit
+            elif max_uses > 0 and uses >= max_uses:
+                response = {'ok': False, 'reason': 'used_up'}
+            else:
+                # Apply the key to the user
+                if ktype == 'infinity':
+                    u['access_type'] = 'infinity'
+                    u['access_expires'] = -1
+                else:
+                    u['access_type'] = ktype
+                    u['access_expires'] = expires_at
+                # consume key use, for infinity keys this will not remove them but will track usage
+                kmeta['uses'] = uses + 1
+                if max_uses > 0 and kmeta['uses'] >= max_uses:
+                    # remove exhausted key
+                    del keys[key]
+                else:
+                    keys[key] = kmeta
+                    
+                u['authorized'] = True
+                u['code_failures'] = []
+
+                response = {'ok': True, 'type': ktype, 'expires_at': expires_at}
+
+        if not response['ok']:
+            # on any failure, record it for the user
+            # failure
+            failures = u.get('code_failures') or []
+            failures = [t for t in failures if now - t <= fail_window]
+            failures.append(now)
+            u['code_failures'] = failures
+            # if too many failures within window, set code_ban
+            if len(failures) >= max_failures:
+                u.setdefault('bans', {})['code_ban_until'] = now + fail_window
 
         data.setdefault('users', {})[str(user_id)] = u
         data['keys'] = keys
         self._save(data)
 
-        return {'ok': True, 'type': ktype, 'expires_at': expires_at}
+        return response
+
+    def generate_code(self, type: str = 'user', ttl: int = 3600, max_uses: int = 1) -> str:
+        """Generate a new code and save it to the `keys` mapping with metadata."""
+        code = self._generate_random_code()
+        if type == 'infinity':
+            expires_at = 0
+            max_uses = 0
+        else:
+            expires_at = int(time.time()) + ttl
+        data = self._load()
+        keys = data.setdefault('keys', {})
+        keys[code] = {
+            'type': type,
+            'expires_at': expires_at,
+            'max_uses': max_uses,
+            'uses': 0
+        }
+        self._save(data)
+        return code

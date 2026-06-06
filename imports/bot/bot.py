@@ -2,242 +2,91 @@
 
 This is a starting point: auth flow, text/image handling, `/new` command, and typing indicator.
 """
-import os
+
 import asyncio
+import hashlib
+import html
+import io
+import json
+import traceback
+
+from aiogram import types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, FSInputFile
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
-import re
-import html
-import math
-from PIL import Image
 
-def compress_image_to_2mp(image_path: str) -> None:
-    try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            total_pixels = width * height
-            if total_pixels > 2000000:
-                scale = math.sqrt(2000000 / total_pixels)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
-                resized_img = img.resize((new_width, new_height), resample=resample_filter)
-                resized_img.save(image_path, format=img.format or 'JPEG')
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Error compressing image {image_path}: {e}")
-
-
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-
-from imports.config import CONFIG, get_provider, get_bot_config, get_telegram_token
-from imports.providers.lm_studio import LMStudioProvider
-from imports.providers.gemini import GeminiProvider
-from imports.memory.store import MemoryStore
+from imports.config import CONFIG, get_bot_config
 from imports.files.store import FileStore
-from imports.mcp.manager import MCPManager
-from imports.orchestrator import Orchestrator
+from imports.files.converter import convert_office_to_markdown, convert_pdf_to_markdown, PANDOC_INPUT_EXTENSIONS
+from imports.orchestrator import Orchestrator, PROMPTS
+
+from imports.stt.whisper_client import STTBusyError
 from imports.utils.logger import get_user_logger, init_logging
-from imports.memory.conversation_store import ConversationStore
-from imports.auth.store import AuthStore
-from imports.stt.whisper_client import WhisperClient, STTBusyError
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-# Basic persistent auth store
-auth_store = AuthStore(PROJECT_ROOT / 'data' / 'state' / 'auth.json')
-
-TELEGRAM_TOKEN = get_telegram_token()
+from imports.bot.globals import bot, dp, auth_store, mem_store, file_store, conv_store, logger, _user_buffers, _user_flush_tasks, PROJECT_ROOT, mcp_mgr, lm, whisper_client
+from imports.bot.utility import markdown_to_html, compress_image_to_2mp
 
 
-class DummyBot:
-    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
-        return None
+async def main():
+    # Initialize logging
+    try:
+        init_logging(CONFIG.get('logging'))
+    except Exception as e:
+        logger.exception("Failed to initialize logging. Exception: %s", e)
 
-    async def send_chat_action(self, chat_id, action):
-        return None
+    # Optionally start MCP manager (do not crash if not configured)
+    try:
+        if mcp_mgr:
+            mcp_mgr.start()
+            for r in mcp_mgr.reports:
+                logger.info("[MCP Report] %s", r)
+    except Exception as e:
+        logger.exception("MCP start failed: %s", e)
 
-    async def delete_message(self, chat_id, message_id):
-        return None
+    # Register bot commands (if real bot)
+    try:
+        await bot.set_my_commands([
+            BotCommand(command='new', description='Start a new conversation'),
+            BotCommand(command='stop', description='Stop current generation'),
+        ])
+    except Exception as e:
+        logger.exception("Failed to set bot commands. Exception: %s", e)
 
-    async def download(self, file, destination):
-        return None
-
-    class session:
-        @staticmethod
-        async def close():
-            return None
-
-def _markdown_to_html(text: str) -> str:
-    """Convert simple CommonMark-like syntax to Telegram-safe HTML.
-
-    - Preserves fenced code blocks (```...```) and inline code (`...`).
-    - Converts nested `_**bold**_` and `**_italic_**` combos to nested tags.
-    - Converts `**...**` and `__...__` to `<b>`, and `_..._` and `*...*` to `<i>`.
-    This is a pragmatic converter for typical assistant outputs; it intentionally
-    HTML-escapes text before injecting tags to avoid accidental HTML.
-    """
-    if not text:
-        return text
-
-    # 1) LaTeX arrow replacements
-    latex_reps = {
-        r"\\rightarrow\b": "→",
-        r"\\leftarrow\b": "←",
-        r"\\Rightarrow\b": "⇒",
-        r"\\Leftarrow\b": "⇐",
-        r"\\leftrightarrow\b": "↔",
-        r"\\Leftrightarrow\b": "⇔",
-        r"\\longrightarrow\b": "⟶",
-        r"\\longleftarrow\b": "⟵",
-        r"\\implies\b": "⟹",
-        r"\\iff\b": "⟺",
-        r"\\to\b": "→",
-    }
-    for k, v in latex_reps.items():
-        text = re.sub(k, v, text)
-
-    # 2) Math symbol replacements
-    math_symbols = {
-        r"\\sim\b": "~",
-        r"\\le\b": "≤",
-        r"\\ge\b": "≥",
-        r"\\leq\b": "≤",
-        r"\\geq\b": "≥",
-        r"\\approx\b": "≈",
-        r"\\neq\b": "≠",
-        r"\\%": "%",
-        r"\\times\b": "×",
-        r"\\div\b": "÷",
-        r"\\pm\b": "±",
-        r"\\cdot\b": "·",
-        r"\\degree\b": "°",
-    }
-    for k, v in math_symbols.items():
-        text = re.sub(k, v, text)
-
-    # 3) \text{...} replacement
-    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
-
-    # 4) Clean up double dollars
-    text = re.sub(r"\$\$(.*?)\$\$", r"\1", text, flags=re.DOTALL)
-
-    # 5) Clean up single dollars
-    def _cb_single_dollar(m):
-        content = m.group(1)
-        contains_math_op = any(op in content for op in ('+', '-', '*', '/', '=', '<', '>', '^', '_', '~', '≤', '≥', '≈', '≠', '±', '·', '°', '×', '÷', '%'))
-        is_short = len(content.strip()) <= 5 and ' ' not in content.strip()
-        
-        words = set(re.findall(r'\b[a-zA-Z]+\b', content.lower()))
-        has_stopwords = bool(words & {'and', 'or', 'the', 'is', 'of', 'to', 'for', 'in', 'with', 'on', 'at', 'by', 'an', 'a'})
-        
-        if contains_math_op or (is_short and len(content.strip()) > 0) or (not has_stopwords and len(content.strip()) > 0):
-            return content
-        else:
-            return f"${content}$"
-            
-    text = re.sub(r"\$([^\$]+?)\$", _cb_single_dollar, text)
-
-
-    # 1) Extract fenced code blocks
-    code_blocks: dict[str, str] = {}
-    def _cb_code(m):
-        key = f"@@CODEBLOCK{len(code_blocks)}@@"
-        code_blocks[key] = m.group(1)
-        return key
-    text = re.sub(r"```(.*?)```", _cb_code, text, flags=re.DOTALL)
-
-    # 2) Extract inline code
-    inline_codes: dict[str, str] = {}
-    def _cb_inline(m):
-        key = f"@@INLCODE{len(inline_codes)}@@"
-        inline_codes[key] = m.group(1)
-        return key
-    text = re.sub(r"`([^`]+?)`", _cb_inline, text)
-
-    # 3) Escape remaining text to HTML
-    text = html.escape(text)
-
-    # 3.5) Typography and list/header adjustments (outside code spans)
-    # Replace long em-dash with shorter en-dash
-    text = text.replace('—', '–')
-
-    # Replace Markdown header markers (#, ##, etc.) at start of line with a chevron
-    # Add a newline before it for better readability
-    # Use multiline flag so ^ matches line starts
-    text = re.sub(r'(?m)^(\s*)#+\s+', r'\n\1➤ ', text)
-
-    # Replace unordered list markers '*' or '-' at start of line with a bullet '•'
-    text = re.sub(r'(?m)^([ \t]*)[\*-][ \t]+', r"\1• ", text)
-
-    # 4) Convert nested combinations first
-    # _**text**_  -> <i><b>text</b></i>
-    text = re.sub(r"(?<![A-Za-z0-9])_(\*\*(.+?)\*\*)_(?![A-Za-z0-9])", lambda m: f"<i><b>{m.group(2)}</b></i>", text, flags=re.DOTALL)
-    # **_text_** -> <b><i>text</i></b>
-    text = re.sub(r"\*\*(\_(.+?)\_)\*\*", lambda m: f"<b><i>{m.group(2)}</i></b>", text, flags=re.DOTALL)
-
-    # 5) Simple strong/italic replacements
-    text = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
-    text = re.sub(r"__(.+?)__", lambda m: f"<b>{m.group(1)}</b>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<![A-Za-z0-9])_(.+?)_(?![A-Za-z0-9])", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<![A-Za-z0-9])\*(.+?)\*(?![A-Za-z0-9])", lambda m: f"<i>{m.group(1)}</i>", text, flags=re.DOTALL)
-
-    # 6) Reinsert inline code (escaped inside code tag)
-    for k, v in inline_codes.items():
-        text = text.replace(k, f"<code>{html.escape(v)}</code>")
-
-    # 7) Reinsert code blocks
-    for k, v in code_blocks.items():
-        text = text.replace(k, f"<pre><code>{html.escape(v)}</code></pre>")
-
-    return text
-
-
-if not TELEGRAM_TOKEN:
-    bot = DummyBot()
-else:
-    bot = Bot(token=TELEGRAM_TOKEN)
-
-dp = Dispatcher()
-logger = logging.getLogger(__name__)
-
-def _build_provider():
-    """Instantiate the correct AI provider based on app_config.yaml → models.main_model."""
-    main_model_cfg = (CONFIG.get('models') or {}).get('main_model') or {}
-    provider_name = main_model_cfg.get('provider', 'lmstudio')
-
-    if provider_name == 'gemini':
-        prov_cfg = get_provider('gemini') or {}
-        # Do NOT read API key from config; prefer environment variable only.
-        model = main_model_cfg.get('model') or prov_cfg.get('default_model') or 'gemini-2.0-flash'
-        return GeminiProvider(default_model=model)
-
-    # default: lmstudio
-    prov_cfg = get_provider('lmstudio') or {}
-    return LMStudioProvider(
-        prov_cfg.get('url') or 'http://192.168.50.212:1234',
-        prov_cfg.get('default_model', 'default_model'),
-    )
-
-lm = _build_provider()
-mem_store = MemoryStore(CONFIG)
-# MCP configuration - pass all mcp blocks to the new manager
-mcp_cfg = CONFIG.get('mcp') or {}
-mcp_mgr = None
-try:
-    mcp_mgr = MCPManager(mcp_cfg)
-except Exception:
-    mcp_mgr = None
-
-# Conversation store (SQLite)
-conv_store = ConversationStore()
+    # Start orchestrator background tasks
+    try:
+        await orchestrator.start()
+    except Exception as e:
+        logger.exception("Orchestrator start failed: %s", e)
+    logger.info("Bot started. Waiting for messages...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        try:
+            await bot.session.close()
+        except Exception as e:
+            logger.exception("Failed to close bot session. Exception: %s", e)
+        try:
+            await orchestrator.stop()
+        except Exception as e:
+            logger.exception("Failed to stop orchestrator. Exception: %s", e)
+        try:
+            mem_store.close()
+        except Exception as e:
+            logger.exception("Failed to close memory store. Exception: %s", e)
+        try:
+            if mcp_mgr and hasattr(mcp_mgr, 'stop'):
+                try:
+                    mcp_mgr.stop()
+                except Exception as e:
+                    logger.exception("Failed to stop MCP manager. Exception: %s", e)
+        except Exception as e:
+            logger.exception("Failed to stop MCP manager. Exception: %s", e)
 
 # Provide model-based merge callback to MemoryStore
 async def _merge_memories(existing: str, new: str) -> str:
     try:
-        from imports.orchestrator import PROMPTS
+        
         merge_prompt = PROMPTS.get('memory_merge_prompt', 'Merge two memory fragments into one concise memory. If the two memories are contradictory, meaningless, or contain no useful text to remember, output exactly the word REJECT.')
         merge_template = PROMPTS.get('memory_merge_user_template', 'Memory A:\n{existing}\n\nMemory B:\n{new}\n\nReturn a single merged memory text, concise.')
         msgs = [
@@ -270,16 +119,17 @@ async def _merge_memories(existing: str, new: str) -> str:
                     if clean_content.upper().startswith('REJECT'):
                         return ""
                     return clean_content
-            except Exception:
+            except Exception as e:
+                logger.exception("Failed to merge memories. Exception: %s", e)
                 await asyncio.sleep(1)
                 continue
                 
         return existing + "\n" + new
-    except Exception:
+    except Exception as e:
+        logger.exception("Failed to merge memories. Exception: %s", e)
         return existing + "\n" + new
 
 mem_store.merge_callback = _merge_memories
-
 
 # Approval callback: sends approval UI to user and waits for user's decision via callback_query handler
 async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]):
@@ -296,60 +146,29 @@ async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]
     )
     try:
         await bot.send_message(user_id, text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("Failed to send approval UI. Exception: %s", e)
 
 
 # Status callback: sends tool status messages to user
 async def _tool_status(chat_id: int, text: str):
     try:
-        await bot.send_message(chat_id, _markdown_to_html(text), parse_mode="HTML")
-    except Exception:
+        await bot.send_message(chat_id, markdown_to_html(text), parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Failed to send tool status. Exception: %s", e)
         try:
             await bot.send_message(chat_id, text)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("Failed to send tool status as plain text. Exception: %s", e)
 
 
 # Send file callback: sends a file to the user
 async def _send_file_callback(chat_id: int, file_path: str, real_name: str):
-    from aiogram.types import FSInputFile
     try:
         f = FSInputFile(file_path, filename=real_name)
         await bot.send_document(chat_id, f)
     except Exception as e:
-        logger.error("Failed to send file %s to chat %d: %s", file_path, chat_id, e)
-        raise
-
-# Initialize FileStore sharing embed_fn and Qdrant client with MemoryStore
-file_store = FileStore(
-    project_root=PROJECT_ROOT,
-    embed_fn=mem_store.embed_fn,
-    embed_dim=mem_store.embed_dimension,
-    qdrant_client=mem_store.qdrant
-)
-
-
-orchestrator = Orchestrator(
-    CONFIG, lm, mem_store,
-    mcp_mgr=mcp_mgr,
-    approval_callback=_approval_ui,
-    status_callback=_tool_status,
-    conv_store=conv_store,
-    file_store=file_store,
-    send_file_callback=_send_file_callback,
-)
-
-# STT (Whisper) client — reads GROQ_API_KEY from env
-whisper_client = WhisperClient(CONFIG.get('whisper', {}))
-
-
-# --- Forward Debounce Buffer ---
-# Keeps track of incoming messages per user so we can group them together
-# if they arrive in rapid succession (e.g. forwarded albums).
-_user_buffers: Dict[int, Dict[str, list]] = {}
-_user_flush_tasks: Dict[int, asyncio.Task] = {}
-
+        logger.exception("Failed to send file %s to chat %d: %s", file_path, chat_id, e)
 
 async def _download_audio(message: types.Message, user_id: int):
     """Download a voice message and save it to data/audio/<user_id>/.
@@ -393,8 +212,8 @@ async def _transcribe_all(paths: list, user_id: int, chat_id: int) -> list:
                     chat_id,
                     "🎙 STT service is busy, please try again later.",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("Failed to send STT busy message. Exception: %s", e)
             return None
         except Exception as e:
             ulog.error("Transcription failed for %s: %s", path, e)
@@ -433,8 +252,8 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
             while True:
                 try:
                     await bot.send_chat_action(cid, "typing")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Failed to send chat action. Exception: %s", e)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
@@ -442,8 +261,8 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
     typing_task = None
     try:
         typing_task = asyncio.create_task(_keep_typing(chat_id))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("Failed to create typing task. Exception: %s", e)
 
     try:
         resp = await orchestrator.submit_primary(user_id, chat_id, final_text, images=images)
@@ -455,8 +274,8 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
             typing_task.cancel()
             try:
                 await typing_task
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("Failed to await typing task. Exception: %s", e)
 
     if not resp:
         await bot.send_message(chat_id, "Empty response from orchestrator")
@@ -473,7 +292,7 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
     if resp.get('assistant'):
         try:
             assistant_text = resp.get('assistant')
-            await bot.send_message(chat_id, _markdown_to_html(assistant_text), parse_mode="HTML")
+            await bot.send_message(chat_id, markdown_to_html(assistant_text), parse_mode="HTML")
         except Exception:
             await bot.send_message(chat_id, resp.get('assistant'))
         return
@@ -486,17 +305,11 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
         else:
             text = f"__{tool}: \"{result}\"__"
         try:
-            await bot.send_message(chat_id, _markdown_to_html(text), parse_mode="HTML")
+            await bot.send_message(chat_id, markdown_to_html(text), parse_mode="HTML")
         except Exception:
             await bot.send_message(chat_id, text)
 
 # -------------------------------
-
-
-def _gen_code() -> str:
-    import random
-    return f"{random.randint(100000, 999999)}"
-
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -510,22 +323,6 @@ async def cmd_start(message: types.Message):
         get_user_logger(user_id).warning("start attempt blocked due to start_ban")
         return
 
-    # generate code (respecting rate-limits and code bans)
-    try:
-        code = auth_store.generate_code(user_id, ttl=ttl)
-    except PermissionError as e:
-        err = str(e)
-        if err == 'code_rate_limited':
-            await message.answer("Please wait before requesting a new code (1 minute limit).")
-        elif err == 'start_banned':
-            await message.answer("You are temporarily banned from requesting codes.")
-        elif err == 'code_banned':
-            await message.answer("You are temporarily banned from requesting codes due to repeated failures.")
-        else:
-            await message.answer("Cannot generate code at the moment.")
-        get_user_logger(user_id).warning(f"code generation blocked: {err}")
-        return
-
     # log code generation (robust lookup of user display name)
     nickname = (
         getattr(message.from_user, 'username', None)
@@ -533,16 +330,16 @@ async def cmd_start(message: types.Message):
         or getattr(message.from_user, 'first_name', None)
         or str(getattr(message.from_user, 'id', 'Unknown'))
     )
-    logger.info(f"Auth code for user {user_id} (@{nickname}): {code}")
-    get_user_logger(user_id).info(f"Auth code generated for @{nickname}: {code}")
-    await message.answer("Initialization code was printed to server console, message owner (@LordWarWar) for it. Then paste it here to authorize.")
+    logger.info(f"User {user_id} (@{nickname}) started the bot.")
+    get_user_logger(user_id).info(f"User {user_id} (@{nickname}) started the bot.")
+    await message.answer("Hello! Welcome to TinyChat. Send your authorization code to proceed. If you don't have one, please contact the administrator. All contacts are in bot description.")
 
 
 @dp.message(Command("new"))
 async def cmd_new(message: types.Message):
     user_id = message.from_user.id
     if not auth_store.is_authorized(user_id):
-        await message.reply("Authorize first with /start")
+        await message.reply("Autorize first with your authorization code.")
         return
 
     # Interrupt any pending approval so the decline is recorded before summarization
@@ -559,9 +356,8 @@ async def cmd_new(message: types.Message):
         # clear history after extraction
         conv_store.clear_history(user_id)
         await message.reply("Started a new conversation: memories extracted and context cleared.")
-    except Exception:
-        import traceback
-        get_user_logger(user_id).exception("Failed to start new conversation")
+    except Exception as e:
+        get_user_logger(user_id).exception("Failed to start new conversation: %s", e)
         print(traceback.format_exc())
         await message.reply("Failed to start new conversation (see server logs)")
 
@@ -570,7 +366,7 @@ async def cmd_new(message: types.Message):
 async def cmd_stop(message: types.Message):
     user_id = message.from_user.id
     if not auth_store.is_authorized(user_id):
-        await message.reply("Authorize first with /start")
+        await message.reply("Autorize first with your authorization code.")
         return
     # Cancel any pending debounce flush
     task = _user_flush_tasks.pop(user_id, None)
@@ -587,80 +383,83 @@ async def cmd_stop(message: types.Message):
 async def handle_all(message: types.Message):
     user_id = message.from_user.id
 
-    # Check for auth key (try redeeming a persistent key first)
-    if message.text:
+    if not auth_store.is_authorized(user_id):
+        if auth_store.is_code_banned(user_id):
+            await message.reply("You are temporarily banned from requesting codes due to repeated failures.")
+            return
         txt = message.text.strip()
         try:
+            # search for key
             res = auth_store.redeem_key(user_id, txt)
+            # it is key
             if isinstance(res, dict) and res.get('ok'):
                 # Granted via key
                 ktype = res.get('type')
                 if ktype == 'infinity':
                     await message.reply("Authorization complete. You have been granted infinite access.")
-                else:
+                elif ktype == 'user':
                     exp = res.get('expires_at', 0) or 0
                     if exp:
-                        from datetime import datetime
                         exp_str = datetime.fromtimestamp(exp).strftime('%Y-%m-%d %H:%M:%S')
                         await message.reply(f"Authorization complete. Access expires at {exp_str}.")
                     else:
                         await message.reply("Authorization complete. Access granted.")
-                get_user_logger(user_id).info("user authorized via key")
+                else:
+                    logger.warning("Unknown key type '%s' for user %d", ktype, user_id)
+                    await message.reply("Authorization complete. Access granted.")
+                get_user_logger(user_id).info("user authorized via key: %s", txt)
                 return
+            # it is not key
             else:
-                # if key wasn't found, fall through to numeric code verification
                 if isinstance(res, dict) and res.get('reason') and res.get('reason') != 'not_found':
                     # Inform user on explicit key failure (expired/used)
                     reason = res.get('reason')
                     if reason == 'expired':
                         await message.reply("This key has expired.")
                         return
-                    if reason == 'used_up':
+                    elif reason == 'used_up':
                         await message.reply("This key has already been used the maximum number of times.")
                         return
-        except Exception:
+                else:
+                    await message.reply("Invalid code. Please check the code and try again.")
+                    return
+        except Exception as e:
             # redemption errors should not block normal code auth flow
-            pass
+            logger.exception("Failed to redeem authorization key. Exception: %s", e)
+            await message.reply("An error occurred while redeeming the key. Please try again or contact support.")
+            return
 
-    # Check for auth code reply (one-time numeric codes)
-    if message.text and auth_store.verify_code(user_id, message.text.strip()):
-        await message.reply("Authorization complete. You can now use the bot.")
-        get_user_logger(user_id).info("user authorized")
-        return
-
-    if not auth_store.is_authorized(user_id):
         await message.reply("Please run /start and authorize first.")
         return
-
-    # Message rate limiting for authorized users
-    try:
-        rate = auth_store.record_message(user_id)
-        if rate.get('banned'):
-            # delete incoming message and notify user
-            try:
-                await bot.delete_message(message.chat.id, message.message_id)
-            except Exception:
-                pass
-            bans = auth_store.get_bans(user_id)
-            ban_until = bans.get('message_ban_until', 0)
-            if ban_until:
-                from datetime import datetime
-                ban_until_str = datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')
-            else:
-                ban_until_str = "a while"
-            await bot.send_message(user_id, f"You are temporarily banned for spamming until {ban_until_str}.")
-            
-            # Clear user's debounce buffer to drop pending forwarded messages
-            _user_buffers.pop(user_id, None)
-            task = _user_flush_tasks.pop(user_id, None)
-            if task and not task.done():
-                task.cancel()
-            
-            # Stop any running orchestrator task for this user
-            await orchestrator.stop_user(user_id)
-            return
-    except Exception:
-        pass
+    else:
+        # Message rate limiting for authorized users
+        try:
+            rate = auth_store.record_message(user_id)
+            if rate.get('banned'):
+                # delete incoming message and notify user
+                try:
+                    await bot.delete_message(message.chat.id, message.message_id)
+                except Exception as e:
+                    logger.exception("Failed to delete processing message. Exception: %s", e)
+                bans = auth_store.get_bans(user_id)
+                ban_until = bans.get('message_ban_until', 0)
+                if ban_until:
+                    ban_until_str = datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    ban_until_str = "a while"
+                await bot.send_message(user_id, f"You are temporarily banned for spamming until {ban_until_str}.")
+                
+                # Clear user's debounce buffer to drop pending forwarded messages
+                _user_buffers.pop(user_id, None)
+                task = _user_flush_tasks.pop(user_id, None)
+                if task and not task.done():
+                    task.cancel()
+                
+                # Stop any running orchestrator task for this user
+                await orchestrator.stop_user(user_id)
+                return
+        except Exception as e:
+            logger.exception("Failed to handle rate limiting. Exception: %s", e)
 
     # Unknown command handling: do not forward to model
     if message.text and message.text.strip().startswith('/'):
@@ -670,13 +469,8 @@ async def handle_all(message: types.Message):
             await message.reply('Unknown command')
             return
 
-    # Handle video_note, poll and other non-file/non-document unsupported content types
-    if message.content_type in ("video_note", "poll"):
-        await message.reply("Invalid input")
-        return
-
     # For audio and video, they are file types that are not supported.
-    if message.content_type in ("audio", "video"):
+    if message.content_type in ("audio", "video", "video_note", "poll"):
         await message.reply("File type does not suported")
         return
 
@@ -687,7 +481,6 @@ async def handle_all(message: types.Message):
         photo = message.photo[-1]
         try:
             # download to memory/temp
-            import io
             bio = io.BytesIO()
             await bot.download(photo, destination=bio)
             bio.seek(0)
@@ -707,8 +500,8 @@ async def handle_all(message: types.Message):
             # Remove temp file
             try:
                 tmp_file.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("Failed to unlink temporary file. Exception: %s", e)
 
             res = file_store.register_image(user_id, compressed_bytes, "image.jpg")
             imgs.append(res["path"])
@@ -741,7 +534,6 @@ async def handle_all(message: types.Message):
             '.tsx', '.jsx', '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.php',
             '.sql', '.rb', '.pl', '.pm',
         }
-        from imports.files.converter import PANDOC_INPUT_EXTENSIONS
         pandoc_extensions = PANDOC_INPUT_EXTENSIONS
         pdf_extensions = {'.pdf'}
 
@@ -756,7 +548,6 @@ async def handle_all(message: types.Message):
 
         if is_image:
             try:
-                import io
                 bio = io.BytesIO()
                 await bot.download(doc, destination=bio)
                 bio.seek(0)
@@ -774,8 +565,8 @@ async def handle_all(message: types.Message):
 
                 try:
                     tmp_file.unlink()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Failed to unlink temporary file. Exception: %s", e)
 
                 res = file_store.register_image(user_id, compressed_bytes, clean_name)
                 imgs.append(res["path"])
@@ -791,7 +582,6 @@ async def handle_all(message: types.Message):
 
         elif is_text:
             try:
-                import io
                 bio = io.BytesIO()
                 await bot.download(doc, destination=bio)
                 doc_bytes = bio.getvalue()
@@ -819,15 +609,9 @@ async def handle_all(message: types.Message):
         elif is_pandoc:
             # ── Office document via Pandoc ──────────────────────────────────
             try:
-                import io
-                from imports.files.converter import convert_office_to_markdown
-                import json
-
                 bio = io.BytesIO()
                 await bot.download(doc, destination=bio)
                 raw_bytes = bio.getvalue()
-
-                import hashlib
                 raw_hash = hashlib.sha256(raw_bytes).hexdigest()
 
                 res = file_store.check_converted_document_exists(user_id, raw_hash)
@@ -841,8 +625,8 @@ async def handle_all(message: types.Message):
                             while True:
                                 try:
                                     await bot.send_chat_action(cid, "upload_document")
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.exception("Failed to send upload document action. Exception: %s", e)
                                 await asyncio.sleep(interval)
                         except asyncio.CancelledError:
                             return
@@ -863,20 +647,20 @@ async def handle_all(message: types.Message):
                         finally:
                             try:
                                 tmp_src.unlink()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception("Failed to unlink temporary file. Exception: %s", e)
                     finally:
                         upload_action_task.cancel()
                         try:
                             await upload_action_task
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.exception("Failed to await upload action task. Exception: %s", e)
 
                     # Delete the "processing" message
                     try:
                         await bot.delete_message(message.chat.id, proc_msg.message_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception("Failed to delete processing message. Exception: %s", e)
 
                     md_bytes = md_text.encode("utf-8")
                     res = file_store.register_converted_document(
@@ -903,11 +687,6 @@ async def handle_all(message: types.Message):
         elif is_pdf:
             # ── PDF via PyMuPDF + Gemini OCR ────────────────────────────────
             try:
-                import io
-                import json
-                from imports.files.converter import convert_pdf_to_markdown
-
-                import hashlib
                 raw_hash = hashlib.sha256(raw_bytes).hexdigest()
 
                 res = file_store.check_converted_document_exists(user_id, raw_hash)
@@ -926,8 +705,8 @@ async def handle_all(message: types.Message):
                                 while True:
                                     try:
                                         await bot.send_chat_action(cid, "upload_document")
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        logger.exception("Failed to send upload document action. Exception: %s", e)
                                     await asyncio.sleep(interval)
                             except asyncio.CancelledError:
                                 return
@@ -945,7 +724,7 @@ async def handle_all(message: types.Message):
                             try:
                                 new_md_text, new_report = await convert_pdf_to_markdown(
                                     tmp_src,
-                                    gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
+                                    gemini_provider=lm,
                                     media_dir=media_dir,
                                     force_ocr_for_pages=corrupted_pages,
                                     return_report=True,
@@ -953,20 +732,20 @@ async def handle_all(message: types.Message):
                             finally:
                                 try:
                                     tmp_src.unlink()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.exception("Failed to unlink temporary file. Exception: %s", e)
                         finally:
                             upload_action_task.cancel()
                             try:
                                 await upload_action_task
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception("Failed to cancel upload action task. Exception: %s", e)
 
                         # Delete the "processing" message
                         try:
                             await bot.delete_message(message.chat.id, proc_msg.message_id)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.exception("Failed to delete processing message. Exception: %s", e)
 
                         # Load existing pages sidecar (if present)
                         pages_file = Path(res["path"]).with_name(raw_hash + "_pages.json")
@@ -975,7 +754,8 @@ async def handle_all(message: types.Message):
                             if pages_file.exists():
                                 with open(pages_file, 'r', encoding='utf-8') as fh:
                                     existing_pages = json.load(fh)
-                        except Exception:
+                        except Exception as e:
+                            logger.exception("Failed to load existing pages file. Exception: %s", e)
                             existing_pages = []
 
                         total_pages = new_report.get("total_pages", 0)
@@ -988,7 +768,8 @@ async def handle_all(message: types.Message):
                                 for i in range(total_pages):
                                     content = parts[i] if i < len(parts) else ""
                                     existing_pages.append({"page": i+1, "content": content, "status": ("extracted" if content else "empty")})
-                            except Exception:
+                            except Exception as e:
+                                logger.exception("Failed to process existing pages. Exception: %s", e)
                                 existing_pages = [{"page": i+1, "content": "", "status": "empty"} for i in range(total_pages)]
 
                         # Check whether all previously corrupted pages were fixed
@@ -1025,14 +806,14 @@ async def handle_all(message: types.Message):
                         else:
                             try:
                                 await message.reply("Retrying OCR did not fix corrupted pages. Keeping previous converted file.")
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception("Failed to reply with failure message. Exception: %s", e)
                             try:
                                 asyncio.create_task(
                                     orchestrator.queue_conversion_failure(user_id, clean_name, f"Retry OCR failed for pages: {corrupted_pages}")
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception("Failed to queue conversion failure. Exception: %s", e)
 
                         with open(res["path"], 'r', encoding='utf-8', errors='replace') as f:
                             md_text = f.read()
@@ -1048,8 +829,8 @@ async def handle_all(message: types.Message):
                             while True:
                                 try:
                                     await bot.send_chat_action(cid, "upload_document")
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.exception("Failed to send upload document action. Exception: %s", e)
                                 await asyncio.sleep(interval)
                         except asyncio.CancelledError:
                             return
@@ -1066,26 +847,26 @@ async def handle_all(message: types.Message):
                         try:
                             md_text, report = await convert_pdf_to_markdown(
                                 tmp_src,
-                                gemini_provider=lm if isinstance(lm, GeminiProvider) else GeminiProvider(),
+                                gemini_provider=lm,
                                 media_dir=media_dir,
                                 return_report=True,
                             )
                         finally:
                             try:
                                 tmp_src.unlink()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception("Failed to unlink temporary file. Exception: %s", e)
                     finally:
                         upload_action_task.cancel()
                         try:
                             await upload_action_task
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.exception("Failed to await upload action task. Exception: %s", e)
 
                     try:
                         await bot.delete_message(message.chat.id, proc_msg.message_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception("Failed to delete processing message. Exception: %s", e)
 
                     total_pages = report.get("total_pages", 0)
                     ocr_pages = report.get("ocr_pages", 0)
@@ -1097,20 +878,20 @@ async def handle_all(message: types.Message):
                         pages_file.parent.mkdir(parents=True, exist_ok=True)
                         with open(pages_file, 'w', encoding='utf-8') as fh:
                             json.dump(report.get('pages', []), fh, ensure_ascii=False)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception("Failed to save pages file. Exception: %s", e)
 
                     if ocr_pages == total_pages and ocr_failures > (total_pages / 2):
                         try:
                             await message.reply("Failed to process PDF: OCR failed for majority of pages. Please provide a clearer scan or try again.")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.exception("Failed to reply with failure message. Exception: %s", e)
                         try:
                             asyncio.create_task(
                                 orchestrator.queue_conversion_failure(user_id, clean_name, f"OCR failed for {ocr_failures}/{total_pages} pages")
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.exception("Failed to queue conversion failure. Exception: %s", e)
                         md_text = ""
                         res = {}
                     else:
@@ -1137,8 +918,8 @@ async def handle_all(message: types.Message):
                 get_user_logger(user_id).warning("Failed to process PDF: %s", e)
                 try:
                     await bot.delete_message(message.chat.id, proc_msg.message_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Failed to delete processing message. Exception: %s", e)
                 await message.reply(f"Failed to process PDF: {e}")
                 return
 
@@ -1220,65 +1001,6 @@ async def handle_all(message: types.Message):
             _flush_user_buffer(user_id, message.chat.id)
         )
 
-
-
-async def main():
-    # Initialize logging
-    try:
-        init_logging(CONFIG.get('logging'))
-    except Exception:
-        pass
-
-    # Optionally start MCP manager (do not crash if not configured)
-    try:
-        if mcp_mgr:
-            mcp_mgr.start()
-            for r in mcp_mgr.reports:
-                logger.info("[MCP Report] %s", r)
-    except Exception as e:
-        logger.exception("MCP start failed: %s", e)
-
-    # Register bot commands (if real bot)
-    try:
-        if TELEGRAM_TOKEN:
-            await bot.set_my_commands([
-                BotCommand(command='new', description='Start a new conversation'),
-                BotCommand(command='stop', description='Stop current generation'),
-            ])
-    except Exception:
-        pass
-
-    # Start orchestrator background tasks
-    try:
-        await orchestrator.start()
-    except Exception as e:
-        logger.exception("Orchestrator start failed: %s", e)
-    logger.info("Bot started. Waiting for messages...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        try:
-            await bot.session.close()
-        except Exception:
-            pass
-        try:
-            await orchestrator.stop()
-        except Exception:
-            pass
-        try:
-            mem_store.close()
-        except Exception:
-            pass
-        try:
-            if mcp_mgr and hasattr(mcp_mgr, 'stop'):
-                try:
-                    mcp_mgr.stop()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
 @dp.callback_query()
 async def handle_tool_approval(call: types.CallbackQuery):
     data = call.data or ""
@@ -1296,11 +1018,34 @@ async def handle_tool_approval(call: types.CallbackQuery):
         await call.answer("Decision sent")
         try:
             await call.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("Failed to delete call message. Exception: %s", e)
     except Exception as e:
         await call.answer("Failed to send decision")
 
+
+### GLOBAL INITIALIZATION
+
+# Initialize FileStore sharing embed_fn and Qdrant client with MemoryStore
+file_store = FileStore(
+    project_root=PROJECT_ROOT,
+    embed_fn=mem_store.embed_fn,
+    embed_dim=mem_store.embed_dimension,
+    qdrant_client=mem_store.qdrant
+)
+
+
+orchestrator = Orchestrator(
+    CONFIG, lm, mem_store,
+    mcp_mgr=mcp_mgr,
+    approval_callback=_approval_ui,
+    status_callback=_tool_status,
+    conv_store=conv_store,
+    file_store=file_store,
+    send_file_callback=_send_file_callback,
+)
+
+### RUN THE BOT
 
 if __name__ == '__main__':
     asyncio.run(main())
