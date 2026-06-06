@@ -15,7 +15,7 @@ from imports.memory.store import MemoryStore
 from imports.memory.conversation_store import ConversationStore
 from imports.stt.whisper_client import WhisperClient
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 auth_store = AuthStore(PROJECT_ROOT / 'data' / 'state' / 'auth.json')
 TELEGRAM_TOKEN = get_telegram_token()
 if not TELEGRAM_TOKEN:

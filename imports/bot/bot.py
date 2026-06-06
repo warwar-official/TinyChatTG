@@ -39,8 +39,6 @@ async def main():
     try:
         if mcp_mgr:
             mcp_mgr.start()
-            for r in mcp_mgr.reports:
-                logger.info("[MCP Report] %s", r)
     except Exception as e:
         logger.exception("MCP start failed: %s", e)
 
