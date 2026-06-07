@@ -1,72 +1,77 @@
-# TinyChatTG — Local LM Studio Telegram AI Bot
+# TinyChatTG — Local LM Studio / Gemini Telegram AI Bot
 
-This repository implements a lightweight Telegram AI assistant that runs against a local LM Studio instance and uses a local memory store with resilient fallbacks.
+TinyChatTG is a lightweight Telegram assistant that runs locally against a provider (LM Studio or Gemini), keeps per-user conversation state, and exposes a small set of tools for file handling and memory management. This README has been updated to match the current code in this repository — links and feature references point to actual modules present in the source tree.
 
-**Quick summary**
-- Local LM Studio provider adapter and chat wrapper.
-- Persistent conversation store and memory (Qdrant + fastembed primary, JSON fallback).
- - Orchestrator with a unified queue, tool discovery, and approval flow.
-- Telegram bot with `/start` (auth), `/new` (extract+clear), command registration, message-rate bans, and safer unknown-command handling.
+Quick summary
+- Local provider adapters for LM Studio and Gemini (async chat wrappers).
+- Persistent per-user conversation history (SQLite) and a memory backend with Qdrant (path mode) and a JSON fallback.
+- Orchestrator handling job queuing, concurrency/rate limits, tool calls and an approval flow.
+- Telegram bot handlers including `/start`, `/new`, and `/stop`, with auth codes and rate protections.
 
-**Implemented features (what's in the code today)**
+Implemented features (what's actually in the code)
 
-- **Providers** — Adapters for both LM Studio and Gemini implemented in [imports/providers/](imports/providers/). They provide async `chat()` wrappers and handle provider-specific responses.
-- **Orchestrator** — Central request flow in [imports/orchestrator.py](imports/orchestrator.py):
-  - Unified queue for inbound user messages and background tasks (summarization, extraction, tool results).
-  - Strict concurrency limits (semaphores) and RPM limits logic.
-  - Integrates `ConversationStore` for persistent context and triggers summarization/extraction when conversation length exceeds limits.
-  - Full tool-call loop execution, supporting both local tools and MCP tools.
-  - Graceful shutdown hooks implemented.
-- **MemoryStore** — fastembed + Qdrant path-mode integration with a robust JSON fallback implemented in [imports/memory/store.py](imports/memory/store.py).
-  - Deduplication, path-mode search, and async model-based memory merging.
-- **ConversationStore (persistent)** — per-user conversation history and summary saved under `data/state/conversations.db`.
-  - Maintains `user`, `assistant`, and `tool` roles correctly for the LLM context window.
-- **MCP manager** — [imports/mcp/manager.py](imports/mcp/manager.py) manages external MCP subprocesses (stdio JSON protocol), automatically handles discovery and allows execution.
-- **Telegram bot** — [imports/bot.py](imports/bot.py):
-  - Debounce buffer to automatically group multiple rapidly forwarded messages or image albums.
-  - `/start` — persistent auth codes and abuse prevention.
-  - `/new` — extracts facts into memories and starts a fresh conversation tail.
-  - Inline keyboard approval flow (`Allow`/`Decline`) for tools requiring permission.
-  - Real-time tool execution status updates sent to the chat.
-- **AuthStore** — persistent auth, start/code bans, and message-rate limits (spam protection).
-- **Logging** — app and per-user logs via [imports/utils/logger.py](imports/utils/logger.py).
-- **File Processing** — Handles files sent to the bot:
-  - **Images**: Automatically compressed to a maximum of 2 megapixels (2MP) and forwarded to the model context.
-  - **Text-based files** (`.txt`, `.md`, `.py`, `.js`, etc.): Stored under `data/documents/<user_id>/`. If <= 15,000 characters, the content is shown in context. Otherwise, the model is notified to use tools to read/search the file.
-  - **Unsupported files / media**: Rejects other file types (e.g. PDFs, binary, video, music) with `"File type does not suported"`.
-  - **Size limit**: Restricts files to a maximum of 2MB.
-- **File Interaction Tools** — Exposes three new local tools for the model:
-  - `file_list` — Lists user's stored text files from newest to oldest.
-  - `file_read_lines` — Returns a paginated range of lines from a file.
-  - `file_search` — Searches for a query string in a file and returns matching lines and snippets (capped at 50 results).
-  - Includes strict path-traversal validation (rejecting `/`, `\\`, and `..` to restrict the model to the user's folder).
+- **Providers** — adapters live in [imports/providers/](imports/providers/). The repository provides `lm_studio` and `gemini` adapters (see [imports/providers/lm_studio.py](imports/providers/lm_studio.py) and [imports/providers/gemini.py](imports/providers/gemini.py)).
 
+- **Orchestrator** — core request flow is implemented in [imports/orchestrator.py](imports/orchestrator.py):
+  - Unified queue for inbound jobs and background coroutines.
+  - Concurrency and simple requests-per-minute limiting (semaphores + timestamp queue).
+  - Integrates `ConversationStore` for per-user context and can schedule summarization/extraction.
+  - Tool discovery (from MCP manager when configured) and a tool-call loop with an approval UI bridge.
 
-- **Config & data locations**
-  - Main config: [data/configs/app_config.yaml](data/configs/app_config.yaml)
-  - Persistent state: `data/state/`
-  - Memory DB and model cache: `data/memory/db/`, `data/memory/model/`
-  - Images: `data/images/<user_id>/`
+- **MemoryStore** — lightweight memory backend in [imports/memory/store.py](imports/memory/store.py) with:
+  - fastembed (if available) + Qdrant (path-mode) when installed and configured.
+  - Deterministic pseudo-embedding + JSON fallback when optional deps are missing.
+  - Deduplication and simple merge thresholds, plus an async merge callback hook.
 
-**How to run (development)**
+- **ConversationStore (persistent)** — per-user conversation history + summaries backed by SQLite at `data/state/conversations.db` (see [imports/memory/conversation_store.py](imports/memory/conversation_store.py)).
 
-1. Create and activate a Python 3.14 venv.
-2. Install dependencies (project requirements may change):
+- **MCP manager** — MCP subprocess management and tool discovery in [imports/mcp/manager.py](imports/mcp/manager.py). It launches configured stdio-based MCP servers, performs a handshake and lists available tools.
+
+- **Telegram bot** — handlers and startup are in [imports/bot/bot.py](imports/bot/bot.py):
+  - `/start` — generates/accepts auth codes and performs abuse protection.
+  - `/new` — extracts memories from the existing conversation and clears the context.
+  - `/stop` — cancels in-flight jobs.
+  - Inline approval buttons (`Allow` / `Decline`) are used for tool calls that require user consent.
+
+- **AuthStore** — persistent auth, key redemption, start/code bans, and message-rate enforcement are implemented in [imports/auth/store.py](imports/auth/store.py).
+
+- **File processing & FileStore** — the code that handles files is under [imports/files/](imports/files/):
+  - Physical files are stored under `data/files/documents/` and `data/files/images/` with a deduplicated hash-based layout. Metadata is indexed in Qdrant when available (see [imports/files/store.py](imports/files/store.py)).
+  - Document conversion helpers are in [imports/files/converter.py](imports/files/converter.py) (Pandoc integration and PDF→Markdown support via PyMuPDF + OCR).
+  - The bot compresses large images to a ~2 megapixel target before further processing (`compress_image_to_2mp` in [imports/bot/utility.py](imports/bot/utility.py)).
+
+- **File-facing tools** — tools exposed to the orchestrator are implemented in [imports/tools/](imports/tools/). Notable tool handlers include:
+  - `file_list` (imports/tools/file_list.py → `list_files`) — list user's stored files.
+  - `file_read_lines` (imports/tools/file_read_lines.py → `read_file_lines`) — return a range of lines and optionally embed images referenced in converted Markdown.
+  - `file_grep` (imports/tools/file_grep.py → `grep_file`) — search for a query string inside a file (returns snippets, capped results).
+  - `file_find_by_name`, `file_find_by_similarity`, `file_create`, `file_add_lines`, `file_replace_lines`, `file_send` — see [imports/tools/](imports/tools/) for exact handlers and schemas.
+  - Tools perform path-safety validation (rejecting path separators and `..`) to prevent traversal.
+
+Config & data locations
+- Main config: `data/configs/app_config.yaml` (loaded by [imports/config.py](imports/config.py)).
+- Persistent state: `data/state/` (conversation DB, auth.json, orchestrator state).
+- File storage: `data/files/documents/`, `data/files/images/` (see FileStore docstring).
+- Memory DB / model cache: `data/memory/db/`, `data/memory/model/`.
+
+How to run (development)
+
+1. Create and activate a Python 3.10+ venv.
+2. Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-3. Set your Telegram token in `.env` file:
+3. Set your Telegram token as an environment variable (e.g., in a `.env` file or export):
 
 ```bash
-TELEGRAM_TOKEN="<your-token>"
+export TELEGRAM_TOKEN="<your-token>"
 ```
 
-4. Run the bot:
+4. Run the bot (execute the bot module directly):
 
 ```bash
-python -m imports.bot
+python imports/bot/bot.py
 ```
 
 5. Run unit tests:
@@ -75,64 +80,34 @@ python -m imports.bot
 pytest -q
 ```
 
-**Prerequisites**
+Prerequisites & notes
+- **Python**: 3.10+ (project may be tested on newer interpreters).
+- Optional services: LM Studio (local OpenAI-compatible endpoint), TinyMCP (MCP subprocess), Qdrant (vector DB) and a fastembed-compatible embedding model for full-memory features. The app falls back to JSON/placeholder implementations when optional deps are missing.
+- **STT / Whisper**: the default `whisper` config in `data/configs/app_config.yaml` contains a `max_size` (25,000,000 bytes = 25MB) used by the STT client; this is NOT a global file upload cap — different components may impose different limits.
 
-- **Python**: 3.10+ (project tested with 3.14). Create and activate a venv.
-- **Optional services**: LM Studio (local OpenAI-compatible endpoint), TinyMCP (MCP subprocess), Qdrant (vector DB) and a fastembed-compatible embedding model for full-memory features.
-- **Install deps**: `python -m pip install -r requirements.txt` (some features gracefully fallback when optional deps are missing).
-
-**Disabling MCP / tools**
-
-- By default the TinyMCP entry in `data/configs/app_config.yaml` is marked `enabled: false` to avoid launching external processes. If you do have an MCP you want the app to start, set `enabled: true` and provide a valid `command`/`args` in the config.
-- The orchestrator will discover MCP tools at startup when an MCP manager is configured and enabled; you can also run the bot without MCP and the app will fall back to local tools (e.g., `remember_info`, `recall_info`).
-
-**Troubleshooting**
-
-- If the bot fails to import `aiogram`/`aiohttp`, install dependencies from `requirements.txt`.
-- If LM Studio is unreachable, set the provider URL in `data/configs/app_config.yaml`.
-- Logs are in the `logs/` directory (per-user logs and `app.log`). Increase verbosity in `data/configs/app_config.yaml` under `logging`.
-
-**TODO (extracted from PROJECT_CONCEPT.md)**
-
-- Consider modality fallbacks; current approach assumes models handle multimodal inputs directly.
-- Implement robust retry mechanisms and fallback models for handling provider errors (503/429).
-- Document setup for optional local services (LM Studio, TinyMCP, Qdrant, fastembed).
-
-**Known requirements & caveats**
-- Dependencies like `aiogram`, `aiohttp`, `qdrant-client`, and `fastembed` are optional: the code uses fallbacks when not present but full features (Qdrant+fastembed) require them installed and a compatible environment.
-- LM Studio URL is configured in [data/configs/app_config.yaml](data/configs/app_config.yaml). The default in the repo points to a local address — update as needed.
-- Background model-based memory merging runs asynchronously and updates memories after the initial (fast) concatenation/merge. This design avoids blocking user flows but means merged content may appear slightly later.
-
-**Files of interest**
-- [imports/bot.py](imports/bot.py) — Telegram handlers and startup.
-- [imports/orchestrator.py](imports/orchestrator.py) — core orchestration and summarization/extraction.
-- [imports/memory/conversation_store.py](imports/memory/conversation_store.py) — persistent conversation history.
-- [imports/memory/store.py](imports/memory/store.py) — memory backend (Qdrant + JSON fallback).
-- [imports/auth/store.py](imports/auth/store.py) — persistent auth, rate-limiting and bans.
-- [imports/providers/lm_studio.py](imports/providers/lm_studio.py) — LM Studio adapter.
-- [imports/mcp/manager.py](imports/mcp/manager.py) — MCP subprocess manager.
-
-**Next recommended improvements**
-- Improve error boundaries for MCP subprocess failures.
-- Provide more comprehensive documentation for running and deploying.
-
-**New features (added)**
-- Per-tool summarization control: tools may include `allow_summarizing: true|false` in their MCP/app tool configs. The orchestrator only schedules summaries for tools that allow it.
-- Setup improvements: `setup.py` now ensures default `data/configs/app_config.yaml` and `data/mcp/app_tools.yaml` are created when missing, and attempts to ensure the `pandoc` binary is available via `pypandoc`.
-- Migration script: `migrate_files.py` was extended to migrate file records into the new FileStore payload shape (adds `media_dir`, `corrupted`, and `corrupted_pages` fields), mark existing users as expired `user` access (adds `access_type` and `access_expires` fields), and ensure MCP tool configs contain `allow_summarizing` when missing.
-- Beta key management: A helper script `scripts/create_beta_keys.py` creates keys and inserts them into `data/state/auth.json` under a `keys` mapping. Keys contain `type`, `expires_at`, `max_uses`, and `label` metadata.
-
-**How to create beta keys**
-
-Run the helper script to create keys and add them to the local auth store:
+Troubleshooting
+- If imports fail when running scripts from the `scripts/` directory, run them from the repository root or add the repo root to `PYTHONPATH`. Alternatively install the package in editable mode:
 
 ```bash
-python scripts/create_beta_keys.py --count 5 --duration-days 30 --max-uses 10 --label "beta-june"
+python -m pip install -e .
 ```
 
-This will print the generated keys and write them to `data/state/auth.json` under the `keys` section.
+- If the bot fails to import `aiogram`/`aiohttp`, install dependencies from `requirements.txt`.
+- Logs are in the `logs/` directory; increase verbosity via `data/configs/app_config.yaml` under `logging`.
 
-**Notes on auth changes**
-- Existing users are marked with `access_type: user` and `access_expires: 0` by the migration (meaning expired). Console/admin keys (in `keys` mapping with type `infinity`) are treated as permanent and can be granted to users manually.
-- The default expiry message is: "Your access expired. Update your plan or use another key." — configurable in `data/configs/app_config.yaml` under `auth.expiry_message`.
+Files of interest
+- [imports/bot/bot.py](imports/bot/bot.py) — Telegram handlers and startup.
+- [imports/orchestrator.py](imports/orchestrator.py) — core orchestration and tool loop.
+- [imports/memory/conversation_store.py](imports/memory/conversation_store.py) — persistent conversation history.
+- [imports/memory/store.py](imports/memory/store.py) — memory backend (Qdrant + JSON fallback).
+- [imports/auth/store.py](imports/auth/store.py) — persistent auth and rate-limiting.
+- [imports/mcp/manager.py](imports/mcp/manager.py) — MCP subprocess manager.
+- [imports/files/store.py](imports/files/store.py) — FileStore and document handling.
 
+If you'd like, I can also:
+- run the test suite and report failures, or
+- apply the same file-locking pattern we added to `AuthStore` to other small JSON-backed stores in the repo.
+
+---
+
+This README was refreshed to match the repository code. If you want different wording or more operational detail (deployment, Docker, systemd unit, example `app_config.yaml`), tell me which sections to expand.
