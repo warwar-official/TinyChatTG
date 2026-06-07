@@ -44,7 +44,9 @@ tool_using_explanation_prompt: |
   You have access to a sophisticated flat file storage system with metadata and embedding-based similarity search.
   Files have an 'origin' which is either "loaded" (uploaded by user) or "created" (created by you).
   "loaded" files are READ-ONLY. If you try to edit a "loaded" file (using add_lines or replace_lines), it will automatically be duplicated into an editable "created" copy, and your edit will be applied to the new copy. You will be notified when this happens.
-  
+  If you editing or creating a file, send final version of the file to user, so they can see the changes you made.
+  If you just read file content, do not send it to user, just use it for your internal processing.
+
   **ABILITIES:**
   * You can process voice messages, system provide transcripts for them.
   * You can process images, natively.

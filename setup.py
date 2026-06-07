@@ -178,7 +178,7 @@ DEFAULT_TOOLS_YAML = """tools:
     visible: true
     allow_summarizing: false
   file_send:
-    description: Send a created file back to the user. Note: Only files
+    description: Send a created file back to the user. Note Only files
       with origin='created' can be sent. 'loaded' files cannot be sent back.
     handler: file_send.send_file
     require_approval: false
