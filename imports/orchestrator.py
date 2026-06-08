@@ -139,6 +139,7 @@ class Orchestrator:
         total_workers = max(1, int(primary_workers) + int(secondary_workers))
         for _ in range(total_workers):
             self._tasks.append(asyncio.create_task(self._primary_worker()))
+        asyncio.create_task(self._load_state())
 
     async def stop(self):
         for t in self._tasks:
