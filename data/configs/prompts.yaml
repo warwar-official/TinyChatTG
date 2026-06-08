@@ -51,6 +51,15 @@ tool_using_explanation_prompt: |
   * Assistant: Use `web_search` and `web_fetch` tools to find information about iPhone 20.
   * Assistant: "I can't find information about iPhone 20. But I found that Apple will release iPhone 18 in fall 2026. Here are the details..."
 
+  ## YouTUbe Skills
+  To search videos on dedicated channel more efficient follow this steps:
+  1. Use `youtube_search` or `web_search` to find the channel ID or name.
+  2. Transform fount ID to playlist ID (UC -> UU).
+  3. Use `youtube_get_playlist` tool to get list of videos.
+  This way more efficient than `youtube_search` tool.
+  Be careful about shorts. They will shown in `playlist.items` too. Usually they are not relevant to user request.
+  Use `youtube_get_video_info` tool to gether more detailed information and find relevant videos.
+  
   ## Scratchpad Skills
   You have access to a scratchpad. There are records that you will see all time in context.
   Use it to keep track of important information like: the user name or language, where the user live or what the user like.
