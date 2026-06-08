@@ -8,6 +8,7 @@ providers:
     name: gemini
     description: Google Gemini REST API provider
     default_model: gemma-4-31b-it
+
 models:
   main_model:
     provider: gemini
@@ -15,6 +16,7 @@ models:
   backup_model:
     provider: gemini
     model: gemma-4-26b-a4b-it
+
 mcp:
   TinyMCP:
     enabled: true
@@ -28,22 +30,26 @@ memory:
   db_path: data/memory/db
   embedding_model: intfloat/multilingual-e5-large
   max_tool_response_chars: 15000
+
 bot:
   auth_code_ttl_seconds: 60
   max_auth_failures_per_ttl: 5
   start_spam_limit_per_minute: 5
   start_spam_ban_seconds: 3600
-  last_messages_tail: 10
-  max_messages: 25
-  max_tool_iterations: 10
+  last_messages_tail: 5
+  max_messages: 15
+  max_tool_iterations: 5
   summarize_tool_results: false
+
 logging:
   debug: true
   logs_path: logs
+
 concurrency:
-  max_concurrent: 1
+  max_concurrent: 4
   requests_per_minute: 15
   primary_workers: 1
+
 whisper:
   url: https://api.groq.com/openai/v1/audio/transcriptions
   rpm: 20

@@ -1,19 +1,27 @@
+# TinyChat (c) 2026 WarWar <somethingstrenge@gmail.com>
+# This file is part of TinyChat.
+# TinyChat is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License v3.
+
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import re
-import uuid
 import time
+import uuid
+import yaml
+
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Callable, List
 
-import yaml
-from imports.utils.logger import get_user_logger
 from imports.config import get_provider
+from imports.memory.conversation_store import ConversationStore
 from imports.providers.gemini import GeminiProvider
 from imports.providers.lm_studio import LMStudioProvider
-
 from imports.tools.file_list import list_files as fl_list
 from imports.tools.file_read_lines import read_file_lines as fl_read
 from imports.tools.file_grep import grep_file as fl_grep
@@ -23,6 +31,7 @@ from imports.tools.file_create import create_file as fl_create
 from imports.tools.file_add_lines import add_lines as fl_add_lines
 from imports.tools.file_replace_lines import replace_lines as fl_replace_lines
 from imports.tools.file_send import send_file as fl_send
+from imports.utils.logger import get_user_logger
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +104,6 @@ class Orchestrator:
             
         # conversation storage for per-user context
         if self.conv_store is None:
-            from imports.memory.conversation_store import ConversationStore
             self.conv_store = ConversationStore()
 
         # Provide a default model-based merge callback to MemoryStore if none provided
@@ -406,7 +414,6 @@ class Orchestrator:
         messages = []
         
         # Format sections
-        from datetime import datetime
         now_str = datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')
         
         summary_section = ""
@@ -499,8 +506,6 @@ class Orchestrator:
                 else:
                     images = meta.get('images') if isinstance(meta, dict) else None
                     if images:
-                        import base64
-                        import mimetypes
                         content = []
                         if text:
                             content.append({"type": "text", "text": text})
@@ -999,7 +1004,6 @@ class Orchestrator:
                 clean_content = "\n".join(lines).strip()
 
             # Attempt to parse JSON from the model
-            import re
             try:
                 parsed = json.loads(clean_content)
                 if isinstance(parsed, list):
@@ -1104,7 +1108,6 @@ class Orchestrator:
                         return ""
                     return clean_content
                 except Exception:
-                    import asyncio
                     await asyncio.sleep(1)
                     continue
                     
@@ -1168,15 +1171,11 @@ class Orchestrator:
         """Background coro: send image to model and store resulting description."""
         ulog = get_user_logger(user_id)
         ulog.debug("describe_image: job starting. hash_name=%s, real_name=%s, user_text=%r", hash_name, real_name, user_text)
-        logger.debug("[user_%d] describe_image: job starting. hash_name=%s, real_name=%s, user_text=%r", user_id, hash_name, real_name, user_text)
         if not self.file_store:
             ulog.warning("describe_image: file_store is not initialized")
             logger.warning("[user_%d] describe_image: file_store is not initialized", user_id)
             return
         try:
-            import base64
-            import mimetypes
-            from pathlib import Path
             imgs_dir = Path(__file__).resolve().parents[1] / 'data' / 'files' / 'images'
             phys = imgs_dir / hash_name
             if not phys.exists():
@@ -1189,15 +1188,13 @@ class Orchestrator:
             mime, _ = mimetypes.guess_type(str(phys))
             mime = mime or 'image/jpeg'
             ulog.debug("describe_image: loaded file size: %d bytes, mime: %s", len(b64), mime)
-            logger.debug("[user_%d] describe_image: loaded file size: %d bytes, mime: %s", user_id, len(b64), mime)
-
+            
             describe_prompt = PROMPTS.get(
                 'image_describe_prompt',
                 'Write a short, search-friendly description of this image for metadata indexing. '
                 'Focus on visible content, subjects, and context. Return only the description, nothing else.'
             )
             ulog.debug("describe_image: prompt used: %r", describe_prompt)
-            logger.debug("[user_%d] describe_image: prompt used: %r", user_id, describe_prompt)
 
             user_content = []
             if user_text:
@@ -1227,12 +1224,10 @@ class Orchestrator:
                     log_msgs.append(m)
 
             ulog.debug("describe_image: calling model with messages: %r", log_msgs)
-            logger.debug("[user_%d] describe_image: calling model with messages: %r", user_id, log_msgs)
-
+            
             resp = await self._chat_with_fallback(msgs, user_id=user_id)
             ulog.debug("describe_image: raw model response: %r", resp)
-            logger.debug("[user_%d] describe_image: raw model response: %r", user_id, resp)
-
+            
             if isinstance(resp, dict) and resp.get('error'):
                 ulog.error("describe_image: model error for %s: %s", hash_name, resp.get('error'))
                 logger.error("[user_%d] describe_image: model error for %s: %s", user_id, hash_name, resp.get('error'))
@@ -1240,12 +1235,10 @@ class Orchestrator:
 
             raw_text = self._extract_text_from_response(resp)
             ulog.debug("describe_image: extracted raw text before thinking stripped: %r", raw_text)
-            logger.debug("[user_%d] describe_image: extracted raw text before thinking stripped: %r", user_id, raw_text)
-
+            
             description = _strip_thinking(raw_text).strip()
             ulog.debug("describe_image: final description: %r", description)
-            logger.debug("[user_%d] describe_image: final description: %r", user_id, description)
-
+            
             if not description:
                 ulog.warning("describe_image: empty description for %s", hash_name)
                 logger.warning("[user_%d] describe_image: empty description for %s", user_id, hash_name)
@@ -1253,7 +1246,6 @@ class Orchestrator:
 
             self.file_store.update_description(user_id, hash_name, description)
             ulog.info("describe_image: stored description for %s (%d chars)", hash_name, len(description))
-            logger.info("[user_%d] describe_image: stored description for %s (%d chars)", user_id, hash_name, len(description))
         except Exception as e:
             ulog.error("describe_image failed for %s: %s", hash_name, e)
             logger.exception("[user_%d] describe_image failed for %s: %s", user_id, hash_name, e)
@@ -1262,13 +1254,11 @@ class Orchestrator:
         """Background coro: send document excerpt to model and store resulting description."""
         ulog = get_user_logger(user_id)
         ulog.debug("describe_document: job starting. hash_name=%s, real_name=%s, user_text=%r", hash_name, real_name, user_text)
-        logger.debug("[user_%d] describe_document: job starting. hash_name=%s, real_name=%s, user_text=%r", user_id, hash_name, real_name, user_text)
         if not self.file_store:
             ulog.warning("describe_document: file_store is not initialized")
             logger.warning("[user_%d] describe_document: file_store is not initialized", user_id)
             return
         try:
-            from pathlib import Path
             docs_dir = Path(__file__).resolve().parents[1] / 'data' / 'files' / 'documents'
             phys = docs_dir / hash_name
             if not phys.exists():
@@ -1288,16 +1278,14 @@ class Orchestrator:
                     break
 
             ulog.debug("describe_document: read %d lines, extracted %d characters for excerpt", len(lines), len(content))
-            logger.debug("[user_%d] describe_document: read %d lines, extracted %d characters for excerpt", user_id, len(lines), len(content))
-
+            
             describe_prompt = PROMPTS.get(
                 'document_describe_prompt',
                 'Write a short, search-friendly description of this document for metadata indexing. '
                 'Focus on the topic, key concepts, and main content. Return only the description, nothing else.'
             )
             ulog.debug("describe_document: prompt used: %r", describe_prompt)
-            logger.debug("[user_%d] describe_document: prompt used: %r", user_id, describe_prompt)
-
+            
             user_msg = ""
             if user_text:
                 user_msg += f"[Users message] {user_text}\n"
@@ -1308,12 +1296,10 @@ class Orchestrator:
                 {"role": "user", "content": user_msg},
             ]
             ulog.debug("describe_document: calling model with messages: %r", msgs)
-            logger.debug("[user_%d] describe_document: calling model with messages: %r", user_id, msgs)
-
+            
             resp = await self._chat_with_fallback(msgs, user_id=user_id)
             ulog.debug("describe_document: raw model response: %r", resp)
-            logger.debug("[user_%d] describe_document: raw model response: %r", user_id, resp)
-
+            
             if isinstance(resp, dict) and resp.get('error'):
                 ulog.error("describe_document: model error for %s: %s", hash_name, resp.get('error'))
                 logger.error("[user_%d] describe_document: model error for %s: %s", user_id, hash_name, resp.get('error'))
@@ -1321,12 +1307,10 @@ class Orchestrator:
 
             raw_text = self._extract_text_from_response(resp)
             ulog.debug("describe_document: extracted raw text before thinking stripped: %r", raw_text)
-            logger.debug("[user_%d] describe_document: extracted raw text before thinking stripped: %r", user_id, raw_text)
-
+            
             description = _strip_thinking(raw_text).strip()
             ulog.debug("describe_document: final description: %r", description)
-            logger.debug("[user_%d] describe_document: final description: %r", user_id, description)
-
+            
             if not description:
                 ulog.warning("describe_document: empty description for %s", hash_name)
                 logger.warning("[user_%d] describe_document: empty description for %s", user_id, hash_name)
@@ -1334,7 +1318,6 @@ class Orchestrator:
 
             self.file_store.update_description(user_id, hash_name, description)
             ulog.info("describe_document: stored description for %s (%d chars)", hash_name, len(description))
-            logger.info("[user_%d] describe_document: stored description for %s (%d chars)", user_id, hash_name, len(description))
         except Exception as e:
             ulog.error("describe_document failed for %s: %s", hash_name, e)
             logger.exception("[user_%d] describe_document failed for %s: %s", user_id, hash_name, e)
