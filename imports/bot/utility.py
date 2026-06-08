@@ -141,6 +141,31 @@ def markdown_to_html(text: str) -> str:
 
     return text
 
+def split_text(text, max_length=4000):
+    """
+    Split text to prevent overflow
+    """
+    chunks = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        chunk = text[:max_length]
+        
+        split_at = chunk.rfind('\n')
+        
+        if split_at == -1:
+            split_at = chunk.rfind(' ')
+            
+        if split_at == -1:
+            split_at = max_length
+            
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].lstrip()
+        
+    return chunks
+
 def compress_image_to_2mp(image_path: str) -> None:
     try:
         with Image.open(image_path) as img:

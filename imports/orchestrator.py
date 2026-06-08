@@ -31,6 +31,10 @@ from imports.tools.file_create import create_file as fl_create
 from imports.tools.file_add_lines import add_lines as fl_add_lines
 from imports.tools.file_replace_lines import replace_lines as fl_replace_lines
 from imports.tools.file_send import send_file as fl_send
+from imports.tools.scratchpad_add import add_record as sp_add
+from imports.tools.scratchpad_remove import remove_record as sp_remove
+from imports.tools.scratchpad_update import update_record as sp_update
+from imports.tools.scratchpad_wipe import wipe_records as sp_wipe
 from imports.utils.logger import get_user_logger
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,7 @@ class Orchestrator:
     def __init__(self, config: Dict[str, Any], provider, mem_store, mcp_mgr=None,
                  approval_callback: Optional[Callable] = None,
                  status_callback: Optional[Callable] = None,
+                 response_callback: Optional[Callable] = None,
                  conv_store=None,
                  file_store=None,
                  send_file_callback: Optional[Callable] = None):
@@ -71,6 +76,7 @@ class Orchestrator:
         self.mcp_mgr = mcp_mgr
         self.approval_callback = approval_callback
         self.status_callback = status_callback
+        self.reply_callback = response_callback
         self.conv_store = conv_store
         self.file_store = file_store
         self.send_file_callback = send_file_callback
@@ -188,7 +194,7 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Failed to load orchestrator state: %s", e)
 
-    async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
+    """async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
         self._stopped_users.discard(user_id)
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
@@ -208,7 +214,23 @@ class Orchestrator:
         # Enqueue the actual job including the future and a reference to the persisted record
         await self.primary_queue.put({**job_record, "future": fut, "_persist": job_record})
         res = await fut
-        return res
+        return res"""
+
+    async def submit_primary(self, user_id, chat_id, text, images=None):
+        self._stopped_users.discard(user_id)
+        loop = asyncio.get_event_loop()
+        job_record = {"user_id": int(user_id), "chat_id": int(chat_id), "text": text, "images": images}
+        try:
+            self._pending_primary_jobs.append(job_record)
+        except Exception:
+            self._pending_primary_jobs = [job_record]
+        try:
+            asyncio.create_task(self.save_state())
+        except Exception:
+            pass
+
+        # No future, no await — just enqueue and return
+        await self.primary_queue.put({**job_record, "_persist": job_record})
 
     async def _primary_worker(self):
         while True:
@@ -259,11 +281,20 @@ class Orchestrator:
                             pass
                         # Persist updated state asynchronously
                         try:
-                            asyncio.create_task(self.save_state())
-                        except Exception:
-                            pass
+                            await self.save_state()  # ← await, not create_task
+                        except Exception as e:
+                            logger.warning("Failed to save state after job completion: %s", e)
                 except Exception:
                     pass
+
+                # Push result back to bot via callback
+                answer = res #.get('assistant') if isinstance(res, dict) else None
+                if answer and self.reply_callback:
+                    chat_id = job.get('chat_id')
+                    try:
+                        await self.reply_callback(chat_id, answer)
+                    except Exception as e:
+                        logger.warning("reply_callback failed: %s", e)
 
                 if fut and not fut.done():
                     fut.set_result(res)
@@ -441,12 +472,24 @@ class Orchestrator:
                     memories_section = template.format(memories=mem_text)
         except Exception as e:
             logger.warning("Failed to search memories for user %d: %s", user_id, e)
+        
+        scratchpad_section = ""
+        try:
+            sp_lines = self.conv_store.get_scratchpad(user_id)
+            if sp_lines:
+                numbered = '\n'.join(f"{i + 1}: {line}" for i, line in enumerate(sp_lines))
+                scratchpad_section = f"[Scratchpad]\n{numbered}\n"
+            else:
+                scratchpad_section = "[Scratchpad]\n[]\n"
+        except Exception as e:
+            logger.warning("Failed to get scratchpad for user %d: %s", user_id, e)
 
         # Build final system content using the template
         sys_content = self.context_template.format(
             personality=self.personality_prompt,
             tool_using_explanation=self.tool_using_explanation_prompt,
             runtime_time=now_str,
+            scratchpad_section=scratchpad_section,
             summary_section=summary_section,
             memories_section=memories_section
         ).strip()
@@ -738,7 +781,10 @@ class Orchestrator:
                             await self.approval_callback(approval_id, user_id, {"name": tool_name, "args": tool_args})
                         except Exception:
                             pass
-                    approved = await fut
+                    try:
+                        approved = await asyncio.wait_for(fut, 30)
+                    except asyncio.TimeoutError:
+                        approved = False
                     self._user_pending_approval.pop(user_id, None)
                     self.pending_approvals.pop(approval_id, None)
 
@@ -859,6 +905,10 @@ class Orchestrator:
                 'file_add_lines.add_lines': lambda: fl_add_lines(fs, user_id, tool_args),
                 'file_replace_lines.replace_lines': lambda: fl_replace_lines(fs, user_id, tool_args),
                 'file_send.send_file': lambda: fl_send(fs, user_id, tool_args),
+                'scratchpad_add.add_record': lambda: sp_add(self.conv_store, user_id, tool_args),
+                'scratchpad_remove.remove_record': lambda: sp_remove(self.conv_store, user_id, tool_args),
+                'scratchpad_update.update_record': lambda: sp_update(self.conv_store, user_id, tool_args),
+                'scratchpad_wipe.wipe_records': lambda: sp_wipe(self.conv_store, user_id, tool_args)
             }
             fn = dispatch.get(handler)
 

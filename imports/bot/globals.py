@@ -3,8 +3,9 @@
 # TinyChat is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License v3.
 
-from pathlib import Path
+import asyncio
 import logging
+
 from aiogram import Bot, Dispatcher
 from imports.bot.utility import build_provider
 from imports.auth.store import AuthStore
@@ -14,6 +15,7 @@ from imports.mcp.manager import MCPManager
 from imports.memory.store import MemoryStore
 from imports.memory.conversation_store import ConversationStore
 from imports.stt.whisper_client import WhisperClient
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 auth_store = AuthStore(PROJECT_ROOT / 'data' / 'state' / 'auth.json')
@@ -32,3 +34,4 @@ file_store = FileStore(project_root=PROJECT_ROOT, embed_fn=mem_store.embed_fn, e
 whisper_client = WhisperClient(CONFIG.get('whisper', {}))
 _user_buffers = {}
 _user_flush_tasks = {}
+typing_queue = asyncio.Queue()

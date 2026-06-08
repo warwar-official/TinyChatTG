@@ -4,6 +4,7 @@
 # it under the terms of the GNU Affero General Public License v3.
 
 import asyncio
+import asyncio
 import hashlib
 import html
 import io
@@ -24,8 +25,8 @@ from imports.orchestrator import Orchestrator, PROMPTS
 
 from imports.stt.whisper_client import STTBusyError
 from imports.utils.logger import get_user_logger, init_logging
-from imports.bot.globals import bot, dp, auth_store, mem_store, file_store, conv_store, logger, _user_buffers, _user_flush_tasks, PROJECT_ROOT, mcp_mgr, lm, whisper_client
-from imports.bot.utility import markdown_to_html, compress_image_to_2mp
+from imports.bot.globals import bot, dp, auth_store, mem_store, file_store, conv_store, logger, _user_buffers, _user_flush_tasks, PROJECT_ROOT, mcp_mgr, lm, whisper_client, typing_queue
+from imports.bot.utility import markdown_to_html, compress_image_to_2mp, split_text
 
 
 async def main():
@@ -50,6 +51,12 @@ async def main():
         ])
     except Exception as e:
         logger.exception("Failed to set bot commands. Exception: %s", e)
+    
+    # Run keep typing
+    try:
+        asyncio.create_task(_keep_typing())
+    except Exception as e:
+        logger.exception("Keep typing start failed: %s", e)
 
     # Start orchestrator background tasks
     try:
@@ -148,6 +155,39 @@ async def _approval_ui(approval_id: str, user_id: int, tool_call: Dict[str, Any]
         logger.exception("Failed to send approval UI. Exception: %s", e)
 
 
+# Typing indicator while processing
+async def _keep_typing(interval: float = 4.0):
+    user_ids = []
+    while True:
+        try:
+            try:
+                command = typing_queue.get_nowait()
+                id = command.get('chat_id', None)
+                action = command.get('action', None)
+                if id and action:
+                    if action == "start":
+                        user_ids.append(id)
+                    elif action == "stop":
+                        try:
+                            user_ids.remove(id)
+                        except:
+                            pass
+                    else:
+                        logger.exception("Unknown keep_typing action: %s", action)
+                else:
+                    logger.exception("Unknown keep_typing command: %s", command)
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                for cid in user_ids:
+                    await bot.send_chat_action(cid, "typing")
+            except Exception as e:
+                logger.exception("Failed to send chat action. Exception: %s", e)
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
+
 # Status callback: sends tool status messages to user
 async def _tool_status(chat_id: int, text: str):
     try:
@@ -158,6 +198,41 @@ async def _tool_status(chat_id: int, text: str):
             await bot.send_message(chat_id, text)
         except Exception as e:
             logger.exception("Failed to send tool status as plain text. Exception: %s", e)
+
+
+async def _answer_callback(chat_id: int, resp: dict):
+    await typing_queue.put({"chat_id":chat_id,"action":"stop"})
+    if not resp:
+        await bot.send_message(chat_id, "Empty response from orchestrator")
+        return
+
+    # Graceful stop/new — no error message needed
+    if resp.get('error') in ('stopped', 'stop', 'new'):
+        return
+
+    if resp.get('error'):
+        await bot.send_message(chat_id, f"Error: {resp.get('error')}")
+        return
+
+    if resp.get('assistant'):
+        try:
+            assistant_text = resp.get('assistant')
+            final_message = markdown_to_html(assistant_text)
+            if len(final_message) > 4000:
+                final_message_parts = split_text(final_message)
+                for part in final_message_parts:
+                    await bot.send_message(chat_id, part, parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id, final_message, parse_mode="HTML")
+        except Exception:
+            final_message = resp.get('assistant')
+            if len(final_message) > 4000:
+                final_message_parts = split_text(final_message)
+                for part in final_message_parts:
+                    await bot.send_message(chat_id, part)
+            else:
+                await bot.send_message(chat_id, final_message,)
+        return
 
 
 # Send file callback: sends a file to the user
@@ -243,69 +318,19 @@ async def _flush_user_buffer(user_id: int, chat_id: int):
 
     # Combine all accumulated parts into one single message context
     final_text = "\n\n".join(parts)
-    
-    # Typing indicator while processing
-    async def _keep_typing(cid: int, interval: float = 4.0):
-        try:
-            while True:
-                try:
-                    await bot.send_chat_action(cid, "typing")
-                except Exception as e:
-                    logger.exception("Failed to send chat action. Exception: %s", e)
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
 
-    typing_task = None
     try:
-        typing_task = asyncio.create_task(_keep_typing(chat_id))
+        await typing_queue.put({"chat_id":chat_id,"action":"start"})
+        # To ensure that action shows now, not after 4 seconds
+        await bot.send_chat_action(chat_id, "typing")
     except Exception as e:
         logger.exception("Failed to create typing task. Exception: %s", e)
 
     try:
-        resp = await orchestrator.submit_primary(user_id, chat_id, final_text, images=images)
+        await orchestrator.submit_primary(user_id, chat_id, final_text, images=images)
     except Exception as e:
         await bot.send_message(chat_id, f"Orchestrator error: {e}")
         return
-    finally:
-        if typing_task:
-            typing_task.cancel()
-            try:
-                await typing_task
-            except Exception as e:
-                logger.exception("Failed to await typing task. Exception: %s", e)
-
-    if not resp:
-        await bot.send_message(chat_id, "Empty response from orchestrator")
-        return
-
-    # Graceful stop/new — no error message needed
-    if resp.get('error') in ('stopped', 'stop', 'new'):
-        return
-
-    if resp.get('error'):
-        await bot.send_message(chat_id, f"Error: {resp.get('error')}")
-        return
-
-    if resp.get('assistant'):
-        try:
-            assistant_text = resp.get('assistant')
-            await bot.send_message(chat_id, markdown_to_html(assistant_text), parse_mode="HTML")
-        except Exception:
-            await bot.send_message(chat_id, resp.get('assistant'))
-        return
-
-    if resp.get('tool'):
-        tool = resp.get('tool')
-        result = resp.get('result')
-        if isinstance(result, dict) and result.get('error'):
-            text = f"__{tool}: \"error: {result.get('error')}\"__"
-        else:
-            text = f"__{tool}: \"{result}\"__"
-        try:
-            await bot.send_message(chat_id, markdown_to_html(text), parse_mode="HTML")
-        except Exception:
-            await bot.send_message(chat_id, text)
 
 # -------------------------------
 
@@ -1038,6 +1063,7 @@ orchestrator = Orchestrator(
     mcp_mgr=mcp_mgr,
     approval_callback=_approval_ui,
     status_callback=_tool_status,
+    response_callback=_answer_callback,
     conv_store=conv_store,
     file_store=file_store,
     send_file_callback=_send_file_callback,
