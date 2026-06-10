@@ -177,6 +177,31 @@ DEFAULT_TOOLS_YAML = """tools:
       type: object
     visible: true
     allow_summarizing: false
+  file_insert_lines:
+    description: Insert lines at a given position without overwriting. Lines are inserted before the line at line_id, shifting the existing content down.
+      If the file is 'loaded' (read-only), it will automatically be duplicated to an editable 'created' copy first.
+    handler: file_insert_lines.insert_lines
+    require_approval: false
+    schema:
+      properties:
+        file_name:
+          type: string
+          description: Name of the file.
+        line_id:
+          type: integer
+          description: The 1-based line number to insert before. If beyond EOF, it appends.
+        lines:
+          type: array
+          items:
+            type: string
+          description: List of strings to insert.
+      required:
+      - file_name
+      - line_id
+      - lines
+      type: object
+    visible: true
+    allow_summarizing: false
   file_send:
     description: Send a created file back to the user. Note Only files
       with origin='created' can be sent. 'loaded' files cannot be sent back.

@@ -3,7 +3,11 @@
 # TinyChat is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License v3.
 
-"""file_replace_lines — replace lines starting at a given position.
+"""file_insert_lines — insert lines at a given position without overwriting.
+
+Lines are inserted *before* the line at ``line_id``, shifting the existing
+content down.  Use ``line_id`` equal to ``total_lines + 1`` (or any value
+beyond EOF) to append at the end of the file.
 
 If the target file has origin='loaded', it is automatically duplicated to
 a new 'created' copy before the edit is applied.
@@ -13,7 +17,7 @@ from typing import Dict, Any, List
 from imports.files.store import FileStore
 
 
-def replace_lines(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
+def insert_lines(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     file_name = args.get('file_name', '').strip()
     line_id = args.get('line_id')
     lines: List[str] = args.get('lines', [])
@@ -27,7 +31,7 @@ def replace_lines(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> 
     if not isinstance(lines, list):
         return {"status": "error", "message": "lines must be a list of strings."}
     if not lines:
-        return {"status": "error", "message": "lines list is empty — nothing to replace."}
+        return {"status": "error", "message": "lines list is empty — nothing to insert."}
 
     try:
         line_id = int(line_id)
@@ -64,18 +68,16 @@ def replace_lines(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> 
     except Exception as e:
         return {"status": "error", "message": f"Error reading file: {e}"}
 
-    # Ensure existing lines don't have trailing newlines so we can safely re-add them
+    # Strip trailing newlines so we can safely re-add them on write
     existing = [l.rstrip('\n').rstrip('\r') for l in existing]
 
-    start_idx = line_id - 1  # convert to 0-based
+    insert_idx = line_id - 1  # convert to 0-based
+    new_lines = [str(l) for l in lines]
 
-    if start_idx >= len(existing):
-        # line_id beyond EOF → just append
-        existing.extend(str(l) for l in lines)
-    else:
-        # Replace slice [start_idx : start_idx + len(lines)]
-        replacement = [str(l) for l in lines]
-        existing[start_idx: start_idx + len(replacement)] = replacement
+    # Clamp to EOF when line_id is beyond the current length (append behaviour)
+    insert_idx = min(insert_idx, len(existing))
+
+    existing[insert_idx:insert_idx] = new_lines
 
     try:
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -89,12 +91,12 @@ def replace_lines(file_store: FileStore, user_id: int, args: Dict[str, Any]) -> 
     return {
         "status": "success",
         "message": (
-            f"{notice}Replaced {len(lines)} line(s) starting at line {line_id} in '{actual_name}'.\n"
+            f"{notice}Inserted {len(lines)} line(s) before line {line_id} in '{actual_name}'.\n"
             f"File now has {len(existing)} line(s)."
         ),
         "file_name": actual_name,
-        "lines_replaced": len(lines),
-        "start_line": line_id,
+        "lines_inserted": len(lines),
+        "insert_before_line": line_id,
         "total_lines": len(existing),
-        "duplicated": record.get('origin') == 'loaded'
+        "duplicated": record.get('origin') == 'loaded',
     }

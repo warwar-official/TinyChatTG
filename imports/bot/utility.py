@@ -31,6 +31,8 @@ def markdown_to_html(text: str) -> str:
     latex_reps = {
         r"\\rightarrow\b": "→",
         r"\\leftarrow\b": "←",
+        r"\\uparrow\b": "↑",
+        r"\\downarrow\b": "↓",
         r"\\Rightarrow\b": "⇒",
         r"\\Leftarrow\b": "⇐",
         r"\\leftrightarrow\b": "↔",
@@ -64,14 +66,31 @@ def markdown_to_html(text: str) -> str:
     }
     for k, v in math_symbols.items():
         text = re.sub(k, v, text)
+    
+    # 3) Greek letter replacments
+    greek_letters = {
+        r"\\alpha\b": "α",
+        r"\\beta\b": "β",
+        r"\\gamma\b": "γ",
+        r"\\delta\b": "δ",
+        r"\\epsilon\b": "ε",
+        r"\\pi\b": "π",
+        r"\\rho\b": "ρ",
+        r"\\sigma\b": "σ",
+        r"\\lambda\b": "λ",
+        r"\\mu\b": "μ",
+        r"\\tau\b": "τ",
+    }
+    for k, v in greek_letters.items():
+        text = re.sub(k, v, text)
 
-    # 3) \text{...} replacement
+    # 4) \text{...} replacement
     text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
 
-    # 4) Clean up double dollars
+    # 5) Clean up double dollars
     text = re.sub(r"\$\$(.*?)\$\$", r"\1", text, flags=re.DOTALL)
 
-    # 5) Clean up single dollars
+    # 6) Clean up single dollars
     def _cb_single_dollar(m):
         content = m.group(1)
         contains_math_op = any(op in content for op in ('+', '-', '*', '/', '=', '<', '>', '^', '_', '~', '≤', '≥', '≈', '≠', '±', '·', '°', '×', '÷', '%'))

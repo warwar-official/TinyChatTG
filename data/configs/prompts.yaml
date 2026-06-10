@@ -18,6 +18,9 @@ tool_using_explanation_prompt: |
   ### Editing
   "loaded" files are READ-ONLY. If you try to edit a "loaded" file (using add_lines or replace_lines), it will automatically be duplicated into an editable "created" copy, and your edit will be applied to the new copy. You will be notified when this happens.
   **IMPORTANT:** After duplication you should reference the new "created" file in future operations, not the original "loaded" one.
+
+  ### Creating
+  If the user ask you to create a new file without any direct instruction about the file type, create .md file. It is more flexible and easy to read.
   
   ## Web Browsing Skills
   You have access to `web_search` and `web_fetch` tools. Use them when you need to find up-to-date information, check facts, or get more details on a topic.

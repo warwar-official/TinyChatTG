@@ -215,24 +215,25 @@ async def _answer_callback(chat_id: int, resp: dict):
         return
 
     if resp.get('assistant'):
-        try:
-            assistant_text = resp.get('assistant')
-            final_message = markdown_to_html(assistant_text)
-            if len(final_message) > 4000:
-                final_message_parts = split_text(final_message)
-                for part in final_message_parts:
-                    await bot.send_message(chat_id, part, parse_mode="HTML")
-            else:
-                await bot.send_message(chat_id, final_message, parse_mode="HTML")
-        except Exception:
-            final_message = resp.get('assistant')
-            if len(final_message) > 4000:
-                final_message_parts = split_text(final_message)
-                for part in final_message_parts:
+        assistant_text = resp.get('assistant')
+        if len(assistant_text) > 4000:
+            final_message_parts = split_text(final_message)
+            for part in final_message_parts:
+                try:
+                    part_html = markdown_to_html(part)
+                    await bot.send_message(chat_id, part_html, parse_mode="HTML")
+                except Exception as e:
+                    logger.exception("Failed to parse part of assistent message: %s", e)
                     await bot.send_message(chat_id, part)
-            else:
-                await bot.send_message(chat_id, final_message,)
+        else:
+            final_message = markdown_to_html(assistant_text)
+            try:
+                await bot.send_message(chat_id, final_message, parse_mode="HTML")
+            except Exception as e:
+                logger.exception("Failed to parse assistant message: %s", e)
+                await bot.send_message(chat_id, assistant_text)
         return
+    logger.exception("Not empty, not error, not assistant respoinse found: %s", resp)
 
 
 # Send file callback: sends a file to the user
@@ -710,6 +711,9 @@ async def handle_all(message: types.Message):
         elif is_pdf:
             # ── PDF via PyMuPDF + Gemini OCR ────────────────────────────────
             try:
+                bio = io.BytesIO()
+                await bot.download(doc, destination=bio)
+                raw_bytes = bio.getvalue()
                 raw_hash = hashlib.sha256(raw_bytes).hexdigest()
 
                 res = file_store.check_converted_document_exists(user_id, raw_hash)
@@ -1059,7 +1063,7 @@ file_store = FileStore(
 
 
 orchestrator = Orchestrator(
-    CONFIG, lm, mem_store,
+    CONFIG, mem_store,
     mcp_mgr=mcp_mgr,
     approval_callback=_approval_ui,
     status_callback=_tool_status,

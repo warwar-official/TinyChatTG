@@ -30,6 +30,7 @@ from imports.tools.file_find_by_similarity import find_by_similarity as fl_find_
 from imports.tools.file_create import create_file as fl_create
 from imports.tools.file_add_lines import add_lines as fl_add_lines
 from imports.tools.file_replace_lines import replace_lines as fl_replace_lines
+from imports.tools.file_insert_lines import insert_lines as fl_insert_lines
 from imports.tools.file_send import send_file as fl_send
 from imports.tools.scratchpad_add import add_record as sp_add
 from imports.tools.scratchpad_remove import remove_record as sp_remove
@@ -63,7 +64,7 @@ def _strip_thinking(text: str) -> str:
 
 
 class Orchestrator:
-    def __init__(self, config: Dict[str, Any], provider, mem_store, mcp_mgr=None,
+    def __init__(self, config: Dict[str, Any], mem_store, mcp_mgr=None,
                  approval_callback: Optional[Callable] = None,
                  status_callback: Optional[Callable] = None,
                  response_callback: Optional[Callable] = None,
@@ -71,7 +72,6 @@ class Orchestrator:
                  file_store=None,
                  send_file_callback: Optional[Callable] = None):
         self.config = config
-        self.provider = provider
         self.mem_store = mem_store
         self.mcp_mgr = mcp_mgr
         self.approval_callback = approval_callback
@@ -134,6 +134,24 @@ class Orchestrator:
         self.tool_summarize_user_template = PROMPTS.get('tool_summarize_user_template', 'Tool: {tool_name}\nResult:\n{tool_result}\n\nSummarize this tool result concisely.')
         self.context_template = PROMPTS.get('context_template', '# ASSISTANT PERSONALITY INFO\n{personality}\n\n# TOOL USING EXPLANATION\nYou have access to tools that can fetch information, manage memories, and perform other actions.\nAlways use available tools if you don\'t know the answer or need to memorize important facts.\n\n# USEFUL RUNTIME INFORMATION\nCurrent system time is {runtime_time}.\n{summary_section}\n{memories_section}')
 
+        # Create providers
+        primary_cfg = (self.config or {}).get('models', {}).get('main_model')
+        if not primary_cfg:
+            logger.error("No primary model specified or config incorrect.")
+        primary_provider = self._build_provider_from_model_cfg(primary_cfg)
+        if primary_provider:
+            self.primary_provider = primary_provider
+
+        backup_cfg = (self.config or {}).get('models', {}).get('backup_model')
+        if not backup_cfg:
+            logger.error("No backup model specified or config incorrect.")
+        backup_provider = self._build_provider_from_model_cfg(backup_cfg)
+        if backup_provider:
+            self.backup_provider = backup_provider
+        
+        if not (primary_provider and backup_provider):
+            raise RuntimeError("No model specified or config incorrect.")
+
 
     async def start(self):
         if self.mcp_mgr:
@@ -193,28 +211,6 @@ class Orchestrator:
                     pass
         except Exception as e:
             logger.warning("Failed to load orchestrator state: %s", e)
-
-    """async def submit_primary(self, user_id: int, chat_id: int, text: str, images: Optional[List[str]] = None) -> Dict[str, Any]:
-        self._stopped_users.discard(user_id)
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        # Persist a JSON-serializable record of the pending job (without future)
-        job_record = {"user_id": int(user_id), "chat_id": int(chat_id), "text": text, "images": images}
-        # Keep the record in pending list for state persistence
-        try:
-            self._pending_primary_jobs.append(job_record)
-        except Exception:
-            self._pending_primary_jobs = [job_record]
-        # Persist state asynchronously
-        try:
-            asyncio.create_task(self.save_state())
-        except Exception:
-            pass
-
-        # Enqueue the actual job including the future and a reference to the persisted record
-        await self.primary_queue.put({**job_record, "future": fut, "_persist": job_record})
-        res = await fut
-        return res"""
 
     async def submit_primary(self, user_id, chat_id, text, images=None):
         self._stopped_users.discard(user_id)
@@ -371,46 +367,48 @@ class Orchestrator:
         Returns the provider response dict or {'error': ...} on failure.
         """
         # Call primary
-        resp = await self._call_provider_chat(self.provider, messages, functions, timeout=timeout)
-        if resp and not (isinstance(resp, dict) and resp.get('error')):
-            return resp
-
-        primary_err = (resp.get('error') if isinstance(resp, dict) else 'empty response from model')
-        logger.error("Primary model error: %s", primary_err)
-        if user_id:
+        if self.primary_provider:
             try:
-                get_user_logger(user_id).error("Primary model error: %s", primary_err)
-            except Exception:
-                pass
+                resp = await self._call_provider_chat(self.primary_provider, messages, functions, timeout=timeout)
+                if resp and not (isinstance(resp, dict) and resp.get('error')):
+                    return resp
 
-        backup_cfg = (self.config or {}).get('models', {}).get('backup_model')
-        if not backup_cfg:
-            return {"error": primary_err}
-
-        try:
-            backup_provider = self._build_provider_from_model_cfg(backup_cfg)
-            if not backup_provider:
-                return {"error": primary_err}
-            resp2 = await self._call_provider_chat(backup_provider, messages, functions, timeout=timeout)
-            if resp2 and not (isinstance(resp2, dict) and resp2.get('error')):
-                logger.info("Backup model succeeded")
+                primary_err = (resp.get('error') if isinstance(resp, dict) else 'empty response from model')
+                logger.error("Primary model error: %s", primary_err)
                 if user_id:
                     try:
-                        get_user_logger(user_id).info("Backup model used for this request")
+                        get_user_logger(user_id).error("Primary model error: %s", primary_err)
                     except Exception:
                         pass
-                return resp2
-            backup_err = (resp2.get('error') if isinstance(resp2, dict) else 'empty response from backup model')
-            logger.error("Backup model error: %s", backup_err)
-            if user_id:
-                try:
-                    get_user_logger(user_id).error("Backup model error: %s", backup_err)
-                except Exception:
-                    pass
-            return {"error": backup_err}
-        except Exception as e:
-            logger.exception("Backup model attempt failed: %s", e)
-            return {"error": str(e)}
+            except Exception as e:
+                get_user_logger(user_id).exception("Primary model error: %s", e)
+        else:
+            logger.error("Primary model not specified.")
+        # Call backup
+        if self.backup_provider:
+            try:
+                resp2 = await self._call_provider_chat(self.backup_provider, messages, functions, timeout=timeout)
+                if resp2 and not (isinstance(resp2, dict) and resp2.get('error')):
+                    logger.info("Backup model succeeded")
+                    if user_id:
+                        try:
+                            get_user_logger(user_id).info("Backup model used for this request")
+                        except Exception:
+                            pass
+                    return resp2
+                backup_err = (resp2.get('error') if isinstance(resp2, dict) else 'empty response from backup model')
+                logger.error("Backup model error: %s", backup_err)
+                if user_id:
+                    try:
+                        get_user_logger(user_id).error("Backup model error: %s", backup_err)
+                    except Exception:
+                        pass
+                return {"error": backup_err}
+            except Exception as e:
+                get_user_logger(user_id).exception("Backup model error: %s", e)
+        else:
+            return {"error": primary_err}
+    
 
     def _build_provider_from_model_cfg(self, model_cfg: Dict[str, Any]):
         """Instantiate a provider object from a models.* config dict.
@@ -421,16 +419,17 @@ class Orchestrator:
         """
         if not model_cfg or not isinstance(model_cfg, dict):
             return None
-        provider_name = model_cfg.get('provider', 'lmstudio')
-        model_name = model_cfg.get('model') or (get_provider(provider_name) or {}).get('default_model')
+        provider_name = model_cfg.get('provider', None)
+        if not provider_name:
+            return None
+        model_name = model_cfg.get('model') or get_provider(provider_name).get('default_model')
         if provider_name == 'gemini':
-            # Do NOT read API key from config here — GeminiProvider will use env var if available
             return GeminiProvider(default_model=model_name)
+        elif provider_name == 'lmstudio':
+            url = get_provider(provider_name).get('url', 'http://127.0.0.1:1234')
+            return LMStudioProvider(url, model_name)
         else:
-            # default to LM Studio provider
-            prov_cfg = get_provider('lmstudio') or {}
-            url = prov_cfg.get('url') or 'http://127.0.0.1:1234'
-            return LMStudioProvider(url, model_name or prov_cfg.get('default_model', 'default_model'))
+            logger.error("Unknown provider: %s". provider_name)
 
     # ─── Context Assembly ───────────────────────────────────────────────
 
@@ -904,6 +903,7 @@ class Orchestrator:
                 'file_create.create_file': lambda: fl_create(fs, user_id, tool_args),
                 'file_add_lines.add_lines': lambda: fl_add_lines(fs, user_id, tool_args),
                 'file_replace_lines.replace_lines': lambda: fl_replace_lines(fs, user_id, tool_args),
+                'file_insert_lines.insert_lines': lambda: fl_insert_lines(fs, user_id, tool_args),
                 'file_send.send_file': lambda: fl_send(fs, user_id, tool_args),
                 'scratchpad_add.add_record': lambda: sp_add(self.conv_store, user_id, tool_args),
                 'scratchpad_remove.remove_record': lambda: sp_remove(self.conv_store, user_id, tool_args),
