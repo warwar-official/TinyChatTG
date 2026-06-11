@@ -120,7 +120,7 @@ class Orchestrator:
             pass
 
         bot_conf = (self.config or {}).get('bot', {})
-        self.last_messages_tail = bot_conf.get('last_messages_tail', 5)
+        self.summarizing_limit = bot_conf.get('summarizing_limit', 5)
         self.max_messages = bot_conf.get('max_messages', 15)
         self.max_tool_iterations = bot_conf.get('max_tool_iterations', 5)
         self.summarize_tool_results = bot_conf.get('summarize_tool_results', True)
@@ -358,9 +358,14 @@ class Orchestrator:
                 # Some providers accept tools kw only when provided
                 resp = await provider_inst.chat(messages, tools=functions if functions else None, timeout=timeout)
                 payload_logger = get_payload_logger()
-                payload_logger.debug("\n---MODEL_CONTEXT-->\n%s\n<---END_MODEL_CONTEXT--", json.dumps(messages, ensure_ascii=False))
-                payload_logger.debug("\n---FUNCTIONS-->\n%s\n<---END_FUNCTIONS--", json.dumps(functions, ensure_ascii=False))
-                payload_logger.debug("\n---MODEL_RESPONSE-->\n%s\n<---END_MODEL_RESPONSE--", json.dumps(resp, ensure_ascii=False))
+                payload_logger.debug(
+                    "\n---MODEL_CONTEXT-->\n%s\n<---END_MODEL_CONTEXT--"
+                    "\n---FUNCTIONS-->\n%s\n<---END_FUNCTIONS--"
+                    "\n---MODEL_RESPONSE-->\n%s\n<---END_MODEL_RESPONSE--",
+                    json.dumps(messages, ensure_ascii=False),
+                    json.dumps(functions, ensure_ascii=False),
+                    json.dumps(resp, ensure_ascii=False)
+                )
                 return resp
         except Exception as e:
             logger.exception("Provider chat raised exception: %s", e)
@@ -435,6 +440,7 @@ class Orchestrator:
             return LMStudioProvider(url, model_name)
         else:
             logger.error("Unknown provider: %s". provider_name)
+            return None
 
     # ─── Context Assembly ───────────────────────────────────────────────
 
@@ -650,19 +656,35 @@ class Orchestrator:
             except Exception as e:
                 ulog.error("Failed to rollback conversation history: %s", e)
 
-        # Check if conversation exceeded message limit — schedule summarization
+        # Sliding window check: find messages that left active context window and are unsummarized
         try:
-            msg_count = self.conv_store.get_history_count(user_id)
-        except Exception:
-            msg_count = 0
-
-        if msg_count > self.max_messages:
-            try:
-                history = self.conv_store.get_history(user_id)
-                convo_copy = list(history)
-                await self.primary_queue.put({"coro": self._summarize_and_extract(user_id, convo_copy)})
-            except Exception as e:
-                ulog.error("Failed to schedule summarization: %s", e)
+            history = self.conv_store.get_history(user_id)
+            updated_at = self._get_summary_updated_at(user_id)
+            
+            start_active = max(0, len(history) - self.max_messages)
+            left_messages = history[:start_active]
+            
+            unsummarized_left = []
+            for msg in left_messages:
+                if msg.get('ts', 0.0) > updated_at:
+                    unsummarized_left.append(msg)
+            
+            # Count user and assistant messages that are not tool calls
+            count = 0
+            for msg in unsummarized_left:
+                role = msg.get('role')
+                meta = msg.get('meta') or {}
+                if role == 'user':
+                    count += 1
+                elif role == 'assistant' and not meta.get('function_call'):
+                    count += 1
+            
+            if count >= self.summarizing_limit:
+                await self.primary_queue.put({
+                    "coro": self._summarize_and_extract(user_id, unsummarized_left, mark_summarized=True)
+                })
+        except Exception as e:
+            ulog.error("Failed to check sliding window summarization: %s", e)
 
         return res
 
@@ -955,8 +977,18 @@ class Orchestrator:
                 )},
             ]
             resp = await self._chat_with_fallback(summary_msgs, user_id=user_id)
+
+            if not resp:
+                ulog.error("Tool \"%s\" summarize error: empty response from model", tool_name)
+                return
+
+            if isinstance(resp, dict) and resp.get('error'):
+                ulog.error("Tool \"%s\" summarize error: %s", tool_name, resp.get('error'))
+                return
+            
             summary = self._extract_text_from_response(resp)
             if not summary:
+                ulog.error("Tool \"%s\" summarize error: empty summary", tool_name)
                 return
 
             # Find and replace the last tool result for this tool in conversation
@@ -975,15 +1007,50 @@ class Orchestrator:
                         break
             if replaced:
                 self.conv_store.set_history(user_id, history)
-                ulog.info("Summarized tool result for %s", tool_name)
+                ulog.info("Tool \"%s\" summarized successfully.", tool_name)
         except Exception as e:
-            ulog.warning("Failed to summarize tool result: %s", e)
+            ulog.error("Failed to summarize tool \"%s\": %s", tool_name, e)
 
 
 
-    async def _summarize_and_extract(self, user_id: int, conversation: List[Any]):
-        """Summarize conversation and extract important facts to memory store."""
+    def _get_summary_updated_at(self, user_id: int) -> float:
+        try:
+            with self.conv_store._connect() as conn:
+                row = conn.execute(
+                    "SELECT updated_at FROM summaries WHERE user_id = ?",
+                    (int(user_id),)
+                ).fetchone()
+                return row['updated_at'] if row else 0.0
+        except Exception:
+            return 0.0
+
+    def _set_summary_with_timestamp(self, user_id: int, summary: str, ts: float):
+        try:
+            with self.conv_store._connect() as conn:
+                conn.execute(
+                    """INSERT INTO summaries (user_id, summary, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(user_id) DO UPDATE SET summary = excluded.summary, updated_at = excluded.updated_at""",
+                    (int(user_id), summary, ts),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error("Failed to set summary with timestamp: %s", e)
+
+    async def _summarize_and_extract(self, user_id: int, conversation: List[Any], mark_summarized: bool = False):
+        """Summarize conversation and extract important facts to memory store.
+        
+        If mark_summarized is True, the summary's updated_at timestamp will be set to
+        the timestamp of the last message in the processed conversation segment.
+        """
         ulog = get_user_logger(user_id)
+
+        # conversation is already pre-filtered by the caller (e.g. sliding window
+        # check uses ts > updated_at before passing unsummarized_left here, and
+        # /new passes the full remaining history).
+        if not conversation:
+            ulog.info("No messages to summarize/extract facts from.")
+            return
 
         # Build conversation text
         try:
@@ -1002,17 +1069,39 @@ class Orchestrator:
         except Exception:
             conv_text = "\n".join([str(x) for x in conversation])
 
+        # Get previous summary
+        previous_summary = ""
+        try:
+            previous_summary = self.conv_store.get_summary(user_id) or ""
+        except Exception:
+            pass
+
+        summary_input = ""
+        if previous_summary:
+            summary_input += f"[Previous conversation summary]\n{previous_summary}\n\n"
+        summary_input += f"[New messages to summarize]\n{conv_text}"
+
         # Summarize (with semaphore)
+        summary = previous_summary
         try:
             summary_msgs = [
                 {"role": "system", "content": self.conversation_summarize_prompt},
-                {"role": "user", "content": conv_text},
+                {"role": "user", "content": summary_input},
             ]
             summ_resp = await self._chat_with_fallback(summary_msgs, user_id=user_id)
-            summary = _strip_thinking(self._extract_text_from_response(summ_resp))
+
+            if not summ_resp:
+                ulog.error("Conversation summary error: empty response from model")
+            elif isinstance(summ_resp, dict) and summ_resp.get('error'):
+                ulog.error("Conversation summary error: %s", summ_resp.get('error'))
+            else:
+                new_summary = _strip_thinking(self._extract_text_from_response(summ_resp))
+                if new_summary:
+                    summary = new_summary
+                else:
+                    ulog.error("Conversation summary error: empty summary")
         except Exception as e:
-            ulog.warning("Summarization failed, using truncation: %s", e)
-            summary = conv_text[:500]
+            ulog.error("Conversation summary failed: %s", e)
 
         # Extract facts as JSON from model (with semaphore)
         extracted = []
@@ -1022,37 +1111,43 @@ class Orchestrator:
                 {"role": "user", "content": conv_text},
             ]
             ex_resp = await self._chat_with_fallback(extract_msgs, user_id=user_id)
-            content = _strip_thinking(self._extract_text_from_response(ex_resp))
-            
-            # Remove markdown backticks if present
-            clean_content = content.strip()
-            if clean_content.startswith("```"):
-                lines = clean_content.splitlines()
-                if len(lines) >= 2:
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines[-1].startswith("```"):
-                        lines = lines[:-1]
-                clean_content = "\n".join(lines).strip()
 
-            # Attempt to parse JSON from the model
-            try:
-                parsed = json.loads(clean_content)
-                if isinstance(parsed, list):
-                    for it in parsed:
-                        title = it.get('title') if isinstance(it, dict) else None
-                        text = it.get('text') if isinstance(it, dict) else None
-                        if text and isinstance(text, str):
-                            if 50 <= len(text) <= 350 and re.search(r'[a-zA-Z]', text):
-                                extracted.append({'title': title or '', 'text': text})
-            except Exception:
-                # fallback: naive split
-                for line in clean_content.splitlines():
-                    line = line.strip()
-                    if not line or line in ("{", "}", "[", "]", "},", "],"):
-                        continue
-                    if 50 <= len(line) <= 350 and re.search(r'[a-zA-Z]', line):
-                        extracted.append({'title': '', 'text': line})
+            if not ex_resp:
+                ulog.error("Conversation fact extraction error: empty response from model")
+            elif isinstance(ex_resp, dict) and ex_resp.get('error'):
+                ulog.error("Conversation fact extraction error: %s", ex_resp.get('error'))
+            else:
+                content = _strip_thinking(self._extract_text_from_response(ex_resp))
+                if content:
+                    # Remove markdown backticks if present
+                    clean_content = content.strip()
+                    if clean_content.startswith("```"):
+                        lines = clean_content.splitlines()
+                        if len(lines) >= 2:
+                            if lines[0].startswith("```"):
+                                lines = lines[1:]
+                            if lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                        clean_content = "\n".join(lines).strip()
+
+                    # Attempt to parse JSON from the model
+                    try:
+                        parsed = json.loads(clean_content)
+                        if isinstance(parsed, list):
+                            for it in parsed:
+                                title = it.get('title') if isinstance(it, dict) else None
+                                text = it.get('text') if isinstance(it, dict) else None
+                                if text and isinstance(text, str):
+                                    if 50 <= len(text) <= 350 and re.search(r'[a-zA-Z]', text):
+                                        extracted.append({'title': title or '', 'text': text})
+                    except Exception:
+                        # fallback: naive split
+                        for line in clean_content.splitlines():
+                            line = line.strip()
+                            if not line or line in ("{", "}", "[", "]", "},", "],"):
+                                continue
+                            if 50 <= len(line) <= 350 and re.search(r'[a-zA-Z]', line):
+                                extracted.append({'title': '', 'text': line})
         except Exception as e:
             ulog.warning("Fact extraction failed: %s", e)
 
@@ -1067,45 +1162,16 @@ class Orchestrator:
             except Exception as e:
                 ulog.warning("Failed to add extracted memory: %s", e)
 
-        # Replace conversation with summarized context + tail in persistent store
-        if self.last_messages_tail and len(conversation) > self.last_messages_tail:
-            cut_idx = len(conversation) - self.last_messages_tail
-            found_user_idx = -1
-            # Search backward for the closest user message (up to 15 messages back)
-            for i in range(cut_idx, max(-1, cut_idx - 15), -1):
-                msg = conversation[i]
-                role = msg.get('role') if isinstance(msg, dict) else 'user'
-                if role == 'user':
-                    found_user_idx = i
-                    break
-            
-            if found_user_idx != -1:
-                tail = conversation[found_user_idx:]
-            else:
-                # Fallback: exact tail but insert a fallback user message at the front
-                tail = conversation[cut_idx:]
-                fallback_msg = {
-                    'role': 'user',
-                    'text': 'Previous conversation truncated. Rely in your answer on summary, memories and messages that left',
-                    'ts': 0
-                }
-                tail.insert(0, fallback_msg)
-        else:
-            tail = conversation
-
-        tail_clean = []
-        for t in tail:
-            if isinstance(t, dict):
-                tail_clean.append(t)
-            else:
-                tail_clean.append({'role': 'user', 'text': str(t), 'ts': 0})
-
+        # Update the summary and mark in the database
         try:
-            self.conv_store.set_history(user_id, tail_clean)
-            self.conv_store.set_summary(user_id, summary)
-            ulog.info("Conversation summarized and trimmed, %d memories extracted", len(extracted))
+            if mark_summarized:
+                max_ts = max((msg.get('ts', 0.0) for msg in conversation if isinstance(msg, dict)), default=0.0)
+                self._set_summary_with_timestamp(user_id, summary, max_ts)
+            else:
+                self.conv_store.set_summary(user_id, summary)
+            ulog.info("Conversation summarized, %d memories extracted", len(extracted))
         except Exception as e:
-            ulog.error("Failed to save summarized conversation: %s", e)
+            ulog.error("Failed to save summary: %s", e)
 
     async def _merge_memory_callback(self, existing: str, new: str) -> str:
         """Use the model to produce a concise merged memory text for two fragments."""

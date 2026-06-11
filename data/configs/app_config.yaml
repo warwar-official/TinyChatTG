@@ -36,7 +36,7 @@ bot:
   max_auth_failures_per_ttl: 5
   start_spam_limit_per_minute: 5
   start_spam_ban_seconds: 3600
-  last_messages_tail: 5
+  summarizing_limit: 5
   max_messages: 15
   max_tool_iterations: 5
   summarize_tool_results: false
