@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fitz
 import logging
-import mimetypes
 import re
 import tempfile
 from pathlib import Path
@@ -187,12 +187,8 @@ async def convert_pdf_to_markdown(
     Raises ImportError if fitz (PyMuPDF) is unavailable.
     Raises RuntimeError on critical processing errors.
     """
-
-    try:
-        import fitz  # PyMuPDF
-        fitz.TOOLS.mupdf_display_errors(False)
-    except ImportError as e:
-        raise ImportError("PyMuPDF is required for PDF conversion. Install it with: pip install PyMuPDF") from e
+    
+    fitz.TOOLS.mupdf_display_errors(False)
 
     doc = fitz.open(str(src_path))
     page_count = len(doc)

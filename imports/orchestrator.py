@@ -36,7 +36,7 @@ from imports.tools.scratchpad_add import add_record as sp_add
 from imports.tools.scratchpad_remove import remove_record as sp_remove
 from imports.tools.scratchpad_update import update_record as sp_update
 from imports.tools.scratchpad_wipe import wipe_records as sp_wipe
-from imports.utils.logger import get_user_logger
+from imports.utils.logger import get_user_logger, get_payload_logger
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +356,12 @@ class Orchestrator:
             await self._acquire_rate_slot()
             async with self.model_semaphore:
                 # Some providers accept tools kw only when provided
-                return await provider_inst.chat(messages, tools=functions if functions else None, timeout=timeout)
+                resp = await provider_inst.chat(messages, tools=functions if functions else None, timeout=timeout)
+                payload_logger = get_payload_logger()
+                payload_logger.debug("\n---MODEL_CONTEXT-->\n%s\n<---END_MODEL_CONTEXT--", json.dumps(messages, ensure_ascii=False))
+                payload_logger.debug("\n---FUNCTIONS-->\n%s\n<---END_FUNCTIONS--", json.dumps(functions, ensure_ascii=False))
+                payload_logger.debug("\n---MODEL_RESPONSE-->\n%s\n<---END_MODEL_RESPONSE--", json.dumps(resp, ensure_ascii=False))
+                return resp
         except Exception as e:
             logger.exception("Provider chat raised exception: %s", e)
             return {"error": str(e)}
@@ -676,18 +681,6 @@ class Orchestrator:
             # Build context fresh each iteration (includes any new tool results appended to history)
             messages = self._build_context(user_id, current_text)
 
-            # Log the model context for debugging (trim large contexts)
-            try:
-                preview = json.dumps(messages, ensure_ascii=False)
-                if len(preview) > 8000:
-                    preview = preview[:8000] + '...'
-                ulog.debug("Model context: %s", preview)
-            except Exception:
-                try:
-                    ulog.debug("Model context (repr): %s", repr(messages)[:8000])
-                except Exception:
-                    pass
-
             # Call provider with automatic fallback to backup model on error
             resp = await self._chat_with_fallback(messages, functions, user_id=user_id)
 
@@ -701,18 +694,6 @@ class Orchestrator:
             choice = resp.get('choices', [None])[0] if isinstance(resp, dict) and resp.get('choices') else resp
             message = choice.get('message', {}) if isinstance(choice, dict) else {}
             tool_calls = message.get('tool_calls') if isinstance(message, dict) else None
-
-            # Log model response for debugging
-            try:
-                preview_r = json.dumps(resp, ensure_ascii=False)
-                if len(preview_r) > 8000:
-                    preview_r = preview_r[:8000] + '...'
-                ulog.debug("Model response: %s", preview_r)
-            except Exception:
-                try:
-                    ulog.debug("Model response (repr): %s", repr(resp)[:8000])
-                except Exception:
-                    pass
 
             if not tool_calls:
                 # Plain text response — done
