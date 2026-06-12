@@ -63,6 +63,7 @@ def markdown_to_html(text: str) -> str:
         r"\\pm\b": "±",
         r"\\cdot\b": "·",
         r"\\degree\b": "°",
+        r"\\checkmark\b": "✓",
     }
     for k, v in math_symbols.items():
         text = re.sub(k, v, text)
