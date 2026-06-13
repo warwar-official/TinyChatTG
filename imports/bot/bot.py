@@ -3,6 +3,7 @@
 # TinyChat is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License v3.
 
+import aiogram
 import asyncio
 import asyncio
 import hashlib
@@ -222,14 +223,14 @@ async def _answer_callback(chat_id: int, resp: dict):
                 try:
                     part_html = markdown_to_html(part)
                     await bot.send_message(chat_id, part_html, parse_mode="HTML")
-                except Exception as e:
+                except aiogram.exceptions.TelegramBadRequest as e:
                     logger.exception("Failed to parse part of assistent message: %s", e)
                     await bot.send_message(chat_id, part)
         else:
             final_message = markdown_to_html(assistant_text)
             try:
                 await bot.send_message(chat_id, final_message, parse_mode="HTML")
-            except Exception as e:
+            except aiogram.exceptions.TelegramBadRequest as e:
                 logger.exception("Failed to parse assistant message: %s", e)
                 await bot.send_message(chat_id, assistant_text)
         return
