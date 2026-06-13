@@ -11,3 +11,4 @@ pytest-asyncio
 pydub
 pypandoc
 PyMuPDF
+pylatexenc

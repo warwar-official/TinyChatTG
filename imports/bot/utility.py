@@ -8,12 +8,20 @@ import html
 import math
 import logging
 from PIL import Image
+from pylatexenc.latex2text import LatexNodes2Text
 
 from imports.config import CONFIG, get_provider
 from imports.providers.gemini import GeminiProvider
 from imports.providers.lm_studio import LMStudioProvider
 
 logger = logging.getLogger(__name__)
+latex_converter = LatexNodes2Text()
+
+def latex_to_text_custom(formula: str) -> str:
+    # Preprocess to prevent pylatexenc from eating spaces after macros/commands
+    formula = re.sub(r"(\\[a-zA-Z]+)(?=\s)", r"\1{}", formula)
+    res = latex_converter.latex_to_text(formula)
+    return res.replace('\u223c', '~')
 
 def markdown_to_html(text: str) -> str:
     """Convert simple CommonMark-like syntax to Telegram-safe HTML.
@@ -27,71 +35,17 @@ def markdown_to_html(text: str) -> str:
     if not text:
         return text
 
-    # 1) LaTeX arrow replacements
-    latex_reps = {
-        r"\\rightarrow\b": "→",
-        r"\\leftarrow\b": "←",
-        r"\\uparrow\b": "↑",
-        r"\\downarrow\b": "↓",
-        r"\\Rightarrow\b": "⇒",
-        r"\\Leftarrow\b": "⇐",
-        r"\\leftrightarrow\b": "↔",
-        r"\\Leftrightarrow\b": "⇔",
-        r"\\longrightarrow\b": "⟶",
-        r"\\longleftarrow\b": "⟵",
-        r"\\implies\b": "⟹",
-        r"\\iff\b": "⟺",
-        r"\\to\b": "→",
-    }
-    for k, v in latex_reps.items():
-        text = re.sub(k, v, text)
+    # 1) Clean up double dollars and convert LaTeX formula inside
+    def _cb_double_dollar(m):
+        formula = m.group(1)
+        try:
+            return latex_to_text_custom(formula)
+        except Exception:
+            return formula
 
-    # 2) Math symbol replacements
-    math_symbols = {
-        r"\\sim\b": "~",
-        r"\\le\b": "≤",
-        r"\\ge\b": "≥",
-        r"\\leq\b": "≤",
-        r"\\geq\b": "≥",
-        r"\\gg\b": "≫",
-        r"\\ll\b": "≪",
-        r"\\approx\b": "≈",
-        r"\\neq\b": "≠",
-        r"\\%": "%",
-        r"\\times\b": "×",
-        r"\\div\b": "÷",
-        r"\\pm\b": "±",
-        r"\\cdot\b": "·",
-        r"\\degree\b": "°",
-        r"\\checkmark\b": "✓",
-    }
-    for k, v in math_symbols.items():
-        text = re.sub(k, v, text)
-    
-    # 3) Greek letter replacments
-    greek_letters = {
-        r"\\alpha\b": "α",
-        r"\\beta\b": "β",
-        r"\\gamma\b": "γ",
-        r"\\delta\b": "δ",
-        r"\\epsilon\b": "ε",
-        r"\\pi\b": "π",
-        r"\\rho\b": "ρ",
-        r"\\sigma\b": "σ",
-        r"\\lambda\b": "λ",
-        r"\\mu\b": "μ",
-        r"\\tau\b": "τ",
-    }
-    for k, v in greek_letters.items():
-        text = re.sub(k, v, text)
+    text = re.sub(r"\$\$(.*?)\$\$", _cb_double_dollar, text, flags=re.DOTALL)
 
-    # 4) \text{...} replacement
-    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
-
-    # 5) Clean up double dollars
-    text = re.sub(r"\$\$(.*?)\$\$", r"\1", text, flags=re.DOTALL)
-
-    # 6) Clean up single dollars
+    # 2) Clean up single dollars and convert LaTeX formula inside if applicable
     def _cb_single_dollar(m):
         content = m.group(1)
         contains_math_op = any(op in content for op in ('+', '-', '*', '/', '=', '<', '>', '^', '_', '~', '≤', '≥', '≈', '≠', '±', '·', '°', '×', '÷', '%'))
@@ -101,11 +55,24 @@ def markdown_to_html(text: str) -> str:
         has_stopwords = bool(words & {'and', 'or', 'the', 'is', 'of', 'to', 'for', 'in', 'with', 'on', 'at', 'by', 'an', 'a'})
         
         if contains_math_op or (is_short and len(content.strip()) > 0) or (not has_stopwords and len(content.strip()) > 0):
-            return content
+            try:
+                return latex_to_text_custom(content)
+            except Exception:
+                return content
         else:
             return f"${content}$"
             
     text = re.sub(r"\$([^\$]+?)\$", _cb_single_dollar, text)
+
+    # 3) Replace remaining isolated LaTeX commands (e.g. \rightarrow, \alpha, \text{...}, \%)
+    def _cb_latex_macro(m):
+        macro = m.group(0)
+        try:
+            return latex_to_text_custom(macro)
+        except Exception:
+            return macro
+
+    text = re.sub(r"\\\w+(?:\{[^{}]*\})*|\\[^\w\s]", _cb_latex_macro, text)
 
 
     # 1) Extract fenced code blocks
