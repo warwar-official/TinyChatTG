@@ -217,7 +217,7 @@ async def _answer_callback(chat_id: int, resp: dict):
     if resp.get('assistant'):
         assistant_text = resp.get('assistant')
         if len(assistant_text) > 4000:
-            final_message_parts = split_text(final_message)
+            final_message_parts = split_text(assistant_text)
             for part in final_message_parts:
                 try:
                     part_html = markdown_to_html(part)
