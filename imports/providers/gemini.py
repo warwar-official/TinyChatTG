@@ -254,7 +254,7 @@ class GeminiProvider:
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
-        timeout: int = 300,
+        timeout: int = 150,
     ) -> Dict[str, Any]:
         """Send a chat request and return an OpenAI-style response dict."""
         used_model = model or self.default_model

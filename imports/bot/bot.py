@@ -234,6 +234,8 @@ async def _answer_callback(chat_id: int, resp: dict):
                 logger.exception("Failed to parse assistant message: %s", e)
                 await bot.send_message(chat_id, assistant_text)
         return
+    
+    await bot.send_message(chat_id, f"Unexpected server responce.")
     logger.exception("Not empty, not error, not assistant respoinse found: %s", resp)
 
 

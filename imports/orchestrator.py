@@ -350,7 +350,7 @@ class Orchestrator:
             # sleep outside the lock to allow other coroutines to progress
             await asyncio.sleep(min(wait_time, 1))
 
-    async def _call_provider_chat(self, provider_inst, messages, functions=None, timeout: int = 300):
+    async def _call_provider_chat(self, provider_inst, messages, functions=None, timeout: int = 150):
         """Call provider.chat with rate-limiting and semaphore, return response or {'error': ...} on exception."""
         try:
             await self._acquire_rate_slot()
@@ -367,11 +367,14 @@ class Orchestrator:
                     json.dumps(resp, ensure_ascii=False)
                 )
                 return resp
+        except asyncio.TimeoutError as e:
+            logger.exception("Provider chat raised timeout exception: %s", e)
+            return {"error": str(e)}
         except Exception as e:
             logger.exception("Provider chat raised exception: %s", e)
             return {"error": str(e)}
 
-    async def _chat_with_fallback(self, messages, functions=None, user_id: Optional[int] = None, timeout: int = 300):
+    async def _chat_with_fallback(self, messages, functions=None, user_id: Optional[int] = None, timeout: int = 150):
         """Call primary provider and fallback to backup model on error.
 
         Returns the provider response dict or {'error': ...} on failure.
@@ -392,6 +395,9 @@ class Orchestrator:
                         pass
             except Exception as e:
                 get_user_logger(user_id).exception("Primary model error: %s", e)
+            except asyncio.TimeoutError as e:
+                get_user_logger(user_id).error("Primary model timeout error: %s", e)
+                
         else:
             logger.error("Primary model not specified.")
         # Call backup
@@ -416,6 +422,8 @@ class Orchestrator:
                 return {"error": backup_err}
             except Exception as e:
                 get_user_logger(user_id).exception("Backup model error: %s", e)
+            except asyncio.TimeoutError as e:
+                get_user_logger(user_id).error("Backup model timeout error: %s", e)
         else:
             return {"error": primary_err}
     

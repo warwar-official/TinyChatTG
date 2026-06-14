@@ -130,28 +130,83 @@ def markdown_to_html(text: str) -> str:
 
 def split_text(text, max_length=4000):
     """
-    Split text to prevent overflow
+    Split text to prevent overflow, keeping code blocks intact/closed across chunks.
     """
     chunks = []
+    in_code_block = False
+    code_block_lang = ""
+
+    def trace_code_blocks(s, start_in_code=False, start_lang=""):
+        in_code = start_in_code
+        lang = start_lang
+        pos = 0
+        while True:
+            pos = s.find("```", pos)
+            if pos == -1:
+                break
+            if not in_code:
+                in_code = True
+                lang_start = pos + 3
+                lang_match = re.match(r"^([a-zA-Z0-9_+-]*)", s[lang_start:])
+                if lang_match:
+                    lang = lang_match.group(1)
+                else:
+                    lang = ""
+            else:
+                in_code = False
+                lang = ""
+            pos += 3
+        return in_code, lang
+
     while text:
-        if len(text) <= max_length:
-            chunks.append(text)
+        # Determine prefix for this chunk
+        prefix = f"```{code_block_lang}\n" if in_code_block else ""
+        
+        # If the whole remaining text + prefix fits, we are done
+        if len(prefix) + len(text) <= max_length:
+            chunks.append(prefix + text)
             break
 
-        chunk = text[:max_length]
-        
+        # Calculate limit for the chunk content
+        # We reserve 4 chars for possible "\n```" suffix
+        limit = max_length - len(prefix) - 4
+        if limit <= 0:
+            limit = max_length
+
+        chunk = text[:limit]
         split_at = chunk.rfind('\n')
-        
         if split_at == -1:
             split_at = chunk.rfind(' ')
-            
         if split_at == -1:
-            split_at = max_length
-            
-        chunks.append(text[:split_at].strip())
-        text = text[split_at:].lstrip()
+            split_at = limit
+
+        chunk_content = text[:split_at].strip()
         
+        # Trace code block status up to the chosen split point
+        end_in_code, end_lang = trace_code_blocks(chunk_content, start_in_code=in_code_block, start_lang=code_block_lang)
+
+        # Optimization: if code block is about to close in the next few characters, close it now
+        if end_in_code:
+            rest = text[split_at:]
+            match = re.match(r"^(\s*```)", rest)
+            if match:
+                extra_len = len(match.group(1))
+                split_at += extra_len
+                chunk_content = text[:split_at].strip()
+                end_in_code, end_lang = trace_code_blocks(chunk_content, start_in_code=in_code_block, start_lang=code_block_lang)
+
+        # Append suffix if we split inside a code block
+        suffix = "\n```" if end_in_code else ""
+        
+        chunks.append(prefix + chunk_content + suffix)
+        
+        # Advance
+        text = text[split_at:].lstrip()
+        in_code_block = end_in_code
+        code_block_lang = end_lang
+
     return chunks
+
 
 def compress_image_to_2mp(image_path: str) -> None:
     try:
