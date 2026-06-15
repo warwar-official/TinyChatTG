@@ -85,7 +85,7 @@ class LMStudioProvider:
                         else:
                             text = await resp.text()
                             return {"error": f"HTTP {resp.status}: {text}"}
-                except aiohttp.ClientError as e:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     attempt += 1
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 5)

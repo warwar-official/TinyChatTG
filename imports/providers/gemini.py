@@ -313,7 +313,7 @@ class GeminiProvider:
                             logger.error("Gemini API error %s: %s", resp.status, text)
                             return {"error": f"HTTP {resp.status}: {text}"}
 
-                except aiohttp.ClientError as exc:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     logger.warning("Gemini request failed (attempt %d): %s", attempt + 1, exc)
                     attempt += 1
                     await asyncio.sleep(backoff)
