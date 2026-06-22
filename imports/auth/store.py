@@ -127,18 +127,43 @@ class AuthStore:
     def _generate_random_code(self, length: int = 24) -> str:
         return secrets.token_urlsafe(length)[:length]
 
-    def is_authorized(self, user_id: int) -> bool:
+    def is_authorized(self, user_id: int) -> dict:
         u = self._get_user(user_id)
         now = time.time()
         # Persistent access wins: infinity or unexpired user access
-        access_type = u.get('access_type')
+        access_type = u.get('access_type', None)
         access_expires = u.get('access_expires', 0) or 0
+        if not access_type:
+            return {
+                "authorized": False,
+                "message": "No Access"
+            }
         if access_type == 'infinity':
-            return True
-        if access_type == 'user' and access_expires and access_expires > now:
-            return True
-        # Fallback to ephemeral session authorization (generated codes)
-        return bool(u.get('authorized', False))
+            return {
+                "authorized": True,
+                "message": "OK"
+            }
+        if access_type == 'user':
+            if not access_expires:
+                return {
+                    "authorized": False,
+                    "message": "No Access"
+                }
+            if access_expires > now:
+                return {
+                    "authorized": True,
+                    "message": "OK"
+                }
+            else:
+                return {
+                    "authorized": False,
+                    "message": "Expired"
+                }
+        else:
+            return {
+                "authorized": False,
+                "message": "Unknown type"
+            }
 
     def add_start_attempt(self, user_id: int, window: int = 60, limit: int = 5, ban_seconds: int = 3600) -> None:
         now = time.time()

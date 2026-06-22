@@ -365,7 +365,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("new"))
 async def cmd_new(message: types.Message):
     user_id = message.from_user.id
-    if not auth_store.is_authorized(user_id):
+    if not auth_store.is_authorized(user_id).get("authorized", False):
         await message.reply("Autorize first with your authorization code.")
         return
 
@@ -392,7 +392,7 @@ async def cmd_new(message: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     user_id = message.from_user.id
-    if not auth_store.is_authorized(user_id):
+    if not auth_store.is_authorized(user_id).get("authorized", False):
         await message.reply("Autorize first with your authorization code.")
         return
     # Cancel any pending debounce flush
@@ -409,13 +409,20 @@ async def cmd_stop(message: types.Message):
 @dp.message()
 async def handle_all(message: types.Message):
     user_id = message.from_user.id
+    auth_responce = auth_store.is_authorized(user_id)
 
-    if not auth_store.is_authorized(user_id):
+    if not auth_responce["authorized"]:
         if auth_store.is_code_banned(user_id):
             await message.reply("You are temporarily banned from requesting codes due to repeated failures.")
             return
-        txt = message.text.strip()
+        if auth_responce["message"] == "Unknown type":
+            await message.reply("Internal authorization error. Please contact the administrator.")
+            return 
         try:
+            txt = message.text.strip() if message.text else None
+            if not txt:
+                await message.reply("Please send your authorization code.")
+                return
             # search for key
             res = auth_store.redeem_key(user_id, txt)
             # it is key
@@ -448,8 +455,15 @@ async def handle_all(message: types.Message):
                         await message.reply("This key has already been used the maximum number of times.")
                         return
                 else:
-                    await message.reply("Invalid code. Please check the code and try again.")
-                    return
+                    if auth_responce["message"] == "Expired":
+                        await message.reply("Your authorization has expired. Please contact the support to renew it.")
+                        return
+                    elif auth_responce["message"] == "No Access":
+                        await message.reply("Send the auth code from the admin to get access.")
+                        return
+                    else:
+                        await message.reply("Unknown authorization error. Please contact the support.")
+                        return
         except Exception as e:
             # redemption errors should not block normal code auth flow
             logger.exception("Failed to redeem authorization key. Exception: %s", e)

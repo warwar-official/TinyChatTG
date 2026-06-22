@@ -1,7 +1,7 @@
 providers:
   lmstudio:
     name: lmstudio
-    url: null
+    url: http://127.0.0.1:8080
     description: LM Studio local OpenAI-compatible endpoint
     default_model: default_model
   gemini:
@@ -11,11 +11,11 @@ providers:
 
 models:
   main_model:
-    provider: gemini
-    model: gemma-4-31b-it
+    provider: lmstudio
+    model: default_model
   backup_model:
-    provider: gemini
-    model: gemma-4-26b-a4b-it
+    provider: lmstudio
+    model: default_model
 
 mcp:
   TinyMCP:
@@ -38,8 +38,8 @@ bot:
   start_spam_ban_seconds: 3600
   summarizing_limit: 5
   max_messages: 15
-  max_tool_iterations: 5
-  summarize_tool_results: false
+  max_tool_iterations: 7
+  summarize_tool_results: true
 
 logging:
   debug: true
@@ -48,7 +48,7 @@ logging:
 concurrency:
   max_concurrent: 4
   requests_per_minute: 15
-  primary_workers: 1
+  primary_workers: 2
 
 whisper:
   url: https://api.groq.com/openai/v1/audio/transcriptions

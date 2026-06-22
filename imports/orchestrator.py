@@ -57,10 +57,12 @@ PROMPTS = _load_prompts()
 
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks from model output."""
+    """Remove all data before </think> from model output."""
     if not text:
         return text
-    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    if '</think>' in text:
+        return text.split('</think>', 1)[1].strip()
+    return text.strip()
 
 
 class Orchestrator:
@@ -374,7 +376,7 @@ class Orchestrator:
             logger.exception("Provider chat raised exception: %s", e)
             return {"error": str(e)}
 
-    async def _chat_with_fallback(self, messages, functions=None, user_id: Optional[int] = None, timeout: int = 150):
+    async def _chat_with_fallback(self, messages, functions=None, user_id: Optional[int] = None, timeout: int = 900):
         """Call primary provider and fallback to backup model on error.
 
         Returns the provider response dict or {'error': ...} on failure.

@@ -32,20 +32,14 @@ def markdown_to_html(text: str) -> str:
     This is a pragmatic converter for typical assistant outputs; it intentionally
     HTML-escapes text before injecting tags to avoid accidental HTML.
     """
-    if not text:
-        return text
-
-    # 1) Clean up double dollars and convert LaTeX formula inside
+    
     def _cb_double_dollar(m):
         formula = m.group(1)
         try:
             return latex_to_text_custom(formula)
         except Exception:
             return formula
-
-    text = re.sub(r"\$\$(.*?)\$\$", _cb_double_dollar, text, flags=re.DOTALL)
-
-    # 2) Clean up single dollars and convert LaTeX formula inside if applicable
+    
     def _cb_single_dollar(m):
         content = m.group(1)
         contains_math_op = any(op in content for op in ('+', '-', '*', '/', '=', '<', '>', '^', '_', '~', '≤', '≥', '≈', '≠', '±', '·', '°', '×', '÷', '%'))
@@ -61,17 +55,24 @@ def markdown_to_html(text: str) -> str:
                 return content
         else:
             return f"${content}$"
-            
-    text = re.sub(r"\$([^\$]+?)\$", _cb_single_dollar, text)
 
-    # 3) Replace remaining isolated LaTeX commands (e.g. \rightarrow, \alpha, \text{...}, \%)
     def _cb_latex_macro(m):
         macro = m.group(0)
         try:
             return latex_to_text_custom(macro)
         except Exception:
             return macro
+    
+    if not text:
+        return text
 
+    # 1) Clean up double dollars and convert LaTeX formula inside
+    text = re.sub(r"\$\$(.*?)\$\$", _cb_double_dollar, text, flags=re.DOTALL)
+
+    # 2) Clean up single dollars and convert LaTeX formula inside if applicable
+    text = re.sub(r"\$([^\$]+?)\$", _cb_single_dollar, text)
+
+    # 3) Replace remaining isolated LaTeX commands (e.g. \rightarrow, \alpha, \text{...}, \%)
     text = re.sub(r"\\\w+(?:\{[^{}]*\})*|\\[^\w\s]", _cb_latex_macro, text)
 
 
